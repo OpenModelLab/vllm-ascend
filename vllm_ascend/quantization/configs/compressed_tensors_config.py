@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import WeightsMapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD
 
+from ..compressed_tensors_packed import install_packed_moe_loader
 from ..methods import AscendLinearScheme, AscendMoEScheme
 from ..utils import is_fused_moe_layer
 
@@ -132,9 +133,10 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                     else is_activation_quantization_format(quant_format)
                 )
                 mixed_precision_format = quant_format == CompressionFormat.mixed_precision.value
+                packed_format = (format or quant_format) == CompressionFormat.pack_quantized.value
 
                 input_activations = quant_config.get("input_activations")
-                if (act_quant_format or mixed_precision_format) and input_activations is not None:
+                if (act_quant_format or mixed_precision_format or packed_format) and input_activations is not None:
                     target_scheme_map[target]["input_activations"] = QuantizationArgs.model_validate(input_activations)
         return target_scheme_map
 
@@ -173,6 +175,8 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
 
             # Store scheme on layer for reference (optional, for debugging)
             layer.scheme = moe_scheme
+            if getattr(moe_scheme, "is_ct_packed", False) is True:
+                install_packed_moe_loader(layer)
             logger.info_once("Using the vLLM Ascend llmcompressor Quantization now!")
             return AscendFusedMoEMethod(moe_scheme, layer.moe_config, tid2eid)
 
@@ -312,6 +316,11 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
 
         # Determine the quantization type
         quant_type = self._detect_quant_type(weight_quant, input_quant, format)
+        is_ct_packed = (
+            format or self.quant_format
+        ) == CompressionFormat.pack_quantized.value and quant_type == "W4A8_DYNAMIC"
+        if is_ct_packed and layer_type != "moe":
+            raise NotImplementedError("Packed per-channel W4A8 is supported only for routed MoE experts.")
 
         # Get the scheme class from registry
         scheme_cls = get_scheme_class(quant_type, layer_type)
@@ -321,7 +330,10 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                 f"quant_type={quant_type}, layer_type={layer_type}."
             )
 
-        return scheme_cls()
+        scheme = scheme_cls()
+        if is_ct_packed:
+            scheme.is_ct_packed = True
+        return scheme
 
     def _detect_quant_type(
         self,
@@ -342,6 +354,17 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         # use the per-layer format if defined, otherwise, use global format
         format = format if format is not None else self.quant_format
         act_quant_format = is_activation_quantization_format(format)
+
+        # Packing defines storage. Keep the INT8 activation contract and unpack
+        # INT4 codes before the native expert loader performs TP/EP slicing.
+        if (
+            format == CompressionFormat.pack_quantized.value
+            and input_quant is not None
+            and weight_quant.type == input_quant.type == QuantizationType.INT
+            and input_quant.dynamic is True
+            and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+        ):
+            return "W4A8_DYNAMIC"
 
         # MXFP8: static FP8 group-wise weights + dynamic FP8 group-wise activations.
         if format == CompressionFormat.mxfp8_quantized.value and self._is_dynamic_group_mx(

@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import torch
+from compressed_tensors.quantization import QuantizationArgs
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import RowParallelLinear, UnquantizedLinearMethod
@@ -114,6 +115,83 @@ class TestAscendCompressedTensorsQuanType(TestBase):
             self.config._detect_quant_type(weight, input_q, "int_quantized")
 
 
+class TestPackedW4A8Config(TestBase):
+    def setUp(self):
+        self.weight = QuantizationArgs(num_bits=4, type="int", strategy="channel", symmetric=True)
+        self.activation = QuantizationArgs(num_bits=8, type="int", strategy="token", symmetric=True, dynamic=True)
+        self.config = AscendCompressedTensorsConfig({}, [], "pack-quantized", {})
+
+    def test_detect_packed_w4a8(self):
+        self.assertEqual(self.config._detect_quant_type(self.weight, self.activation, None), "W4A8_DYNAMIC")
+
+    def test_preserves_packed_activation_contract(self):
+        for global_format, group_format in (
+            ("pack-quantized", None),
+            ("mixed-precision", "pack-quantized"),
+            ("int-quantized", "pack-quantized"),
+        ):
+            with self.subTest(global_format=global_format):
+                config = {
+                    "format": global_format,
+                    "config_groups": {
+                        "experts": {
+                            "targets": ["Linear"],
+                            "format": group_format,
+                            "weights": self.weight.model_dump(),
+                            "input_activations": self.activation.model_dump(),
+                        },
+                    },
+                }
+                parsed = AscendCompressedTensorsConfig.from_config(config)
+                scheme = parsed.target_scheme_map["Linear"]
+                self.assertEqual(scheme["input_activations"], self.activation)
+                self.assertEqual(
+                    parsed._detect_quant_type(scheme["weights"], scheme["input_activations"], scheme["format"]),
+                    "W4A8_DYNAMIC",
+                )
+
+    def test_rejects_unsupported_packed_contracts(self):
+        cases = (
+            ({"type": "float"}, {}),
+            ({}, {"type": "float"}),
+            ({"symmetric": False}, {}),
+            ({}, {"symmetric": False}),
+            ({"dynamic": True}, {}),
+            ({}, {"dynamic": False}),
+            ({}, {"dynamic": "local"}),
+            ({"strategy": "group", "group_size": 128}, {}),
+            ({}, {"strategy": "tensor"}),
+            ({}, {"num_bits": 4}),
+        )
+        for weight_updates, activation_updates in cases:
+            with self.subTest(weight=weight_updates, activation=activation_updates), self.assertRaises(
+                NotImplementedError
+            ):
+                self.config._detect_quant_type(
+                    self.weight.model_copy(update=weight_updates),
+                    self.activation.model_copy(update=activation_updates),
+                    "pack-quantized",
+                )
+
+    def test_preserves_native_weight_only_w4a16(self):
+        weight = self.weight.model_copy(update={"strategy": "group", "group_size": 128})
+        self.assertEqual(self.config._detect_quant_type(weight, None, "pack-quantized"), "W4A16")
+
+    def test_rejects_packed_w4a8_linear(self):
+        with self.assertRaisesRegex(NotImplementedError, "only for routed MoE"):
+            self.config._create_scheme_for_layer_type(self.weight, self.activation, "pack-quantized", "linear")
+
+    @patch("vllm_ascend.quantization.methods.get_scheme_class")
+    def test_marks_only_packed_w4a8_moe(self, get_scheme_class):
+        for format in ("pack-quantized", "int-quantized"):
+            with self.subTest(format=format):
+                scheme = get_scheme_class.return_value.return_value = torch.nn.Module()
+                result = self.config._create_scheme_for_layer_type(self.weight, self.activation, format, "moe")
+                self.assertIs(result, scheme)
+                self.assertEqual(getattr(result, "is_ct_packed", False), format == "pack-quantized")
+                get_scheme_class.assert_called_with("W4A8_DYNAMIC", "moe")
+
+
 class TestAscendCompressedTensorsConfigGetQuantMethod(TestBase):
     def setUp(self):
         self.config = AscendCompressedTensorsConfig.from_config(COMPRESSED_TENSORS_W8A8_CONFIG)
@@ -171,6 +249,23 @@ class TestAscendCompressedTensorsConfigGetQuantMethod(TestBase):
         self.assertIs(result, mock_method.return_value)
         self.assertIs(layer.scheme, moe_scheme)
         mock_method.assert_called_once_with(moe_scheme, layer.moe_config, None)
+
+    @patch("vllm_ascend.quantization.configs.compressed_tensors_config.install_packed_moe_loader")
+    @patch("vllm_ascend.quantization.method_adapters.AscendFusedMoEMethod")
+    def test_installs_packed_loader_only_for_packed_experts(self, _mock_method, install_loader):
+        layer = RoutedExperts.__new__(RoutedExperts)
+        torch.nn.Module.__init__(layer)
+        layer.moe_config = MagicMock()
+        scheme = torch.nn.Module()
+        for packed in (False, True):
+            scheme.is_ct_packed = packed
+            install_loader.reset_mock()
+            with patch.object(self.config, "_get_moe_scheme", return_value=scheme):
+                self.config.get_quant_method(layer, "model.layers.0.mlp.experts")
+            if packed:
+                install_loader.assert_called_once_with(layer)
+            else:
+                install_loader.assert_not_called()
 
     def test_no_quant_method(self):
         layer = MagicMock(spec=Attention)
