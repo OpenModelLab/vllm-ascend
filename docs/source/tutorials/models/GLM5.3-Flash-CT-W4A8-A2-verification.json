@@ -168,7 +168,7 @@
     "real_weights_generation": "not_run_no_NPU",
     "dummy_generation": "not_run_no_NPU",
     "EP_ACLGraph_flashcomm1_MTP_vision": "not_run_no_NPU",
-    "capacity_128k_batch16": "not_run_unknown_SKU_HBM_card_count",
+    "capacity_128k_batch16": "not_run_no_NPU; user confirmed 910B3 4x64GB",
     "AISBench_3.1.20260630": "not_run_no_endpoint"
   },
   "policy": {
@@ -178,7 +178,7 @@
     "C8": "existing 0.32 SFA INT8 and separate KPool INT8 flags; no offline cache rewriting"
   },
   "changed_files_sha256": {
-    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2.md": "8da60fc4023944b4f7fbaafa6ebed041db15feafac1076c8c819b667f55aa058",
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2.md": "4fa62cda572d1a9945d249378a8784c9458c9d3c51560aa4ab6cb5bb8be66976",
     "docs/source/tutorials/models/index.md": "ae532e52cc9536a06843eb945c74446a579eb09c4a5c801378e7eefbb548ba9f",
     "tests/e2e/pull_request/one_card/test_ct_w4a8_loading.py": "f68d93c03dfb4427bcd58a5cbe144fae56e306fe205717488bf45c66288ec715",
     "tests/e2e/pull_request/one_card/test_glm5next_ct_linears.py": "23d66f448b124994c787dd5ee6882b01ac323f5edb0ac8f23eb4c17cc9b0b6e4",
@@ -206,5 +206,19 @@
     "vllm_ascend/quantization/configs/compressed_tensors_config.py": "be5a7611d1e9eb1d3a10fd48dbb938865f972c729701e52cd1e20b8f629abf6c",
     "vllm_ascend/quantization/glm5next.py": "4fe7d128d8e10a15dd22b4f9b3781c38770cbce59581181dcdf94b3e594f4c10",
     "vllm_ascend/quantization/methods/w4a8/w4a8.py": "b3199977cbf28c3d6f4e5a4c227e58ad44c0941bd6e2266dd7e909a809326b46"
+  },
+  "deployment_hardware": {
+    "source": "user confirmed",
+    "soc": "Ascend910B3",
+    "SOC_VERSION": "ascend910b3",
+    "cards": 4,
+    "HBM_per_card": "64 GB reported; runtime bytes not measured",
+    "tensor_parallel_size": 4,
+    "expert_parallel": true,
+    "max_model_len": 4096,
+    "max_num_seqs": 1,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.85,
+    "status": "configuration only; no NPU execution"
   }
 }

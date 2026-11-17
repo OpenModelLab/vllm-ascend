@@ -50,17 +50,19 @@ set -euo pipefail
 cd /mnt/share/w30015592/A2-vllm-ascend-0.32.0
 git status --short
 docker build -f Dockerfile \
+  --build-arg SOC_VERSION=ascend910b3 \
   --build-arg VLLM_COMMIT=5df63a7203cdb9328d824a27b682e77c7b9928be \
   -t glm53-ct-a2:v032 .
 ```
 
-`SOC_VERSION` 采用官方 Dockerfile 默认 `ascend910b1`；具体 A2 SKU 不同应使用与节点一致的构建值。
+用户已确认节点为 **Ascend 910B3，64 GB × 4**；构建显式使用 `ascend910b3`，
+不沿用 Dockerfile 默认的 `ascend910b1`。仓库硬件映射及 A2 自定义算子构建分支已包含该型号。
 在专用容器中映射所用 NPU、驱动及 `/mnt/share`。镜像已复制并 editable 安装本次代码。
 若在已有配套 0.32 A2 开发容器中安装，命令如下：
 
 ```bash
 cd /vllm-workspace/vllm-ascend
-python -m pip install --no-deps --no-build-isolation -e .
+SOC_VERSION=ascend910b3 python -m pip install --no-deps --no-build-isolation -e .
 python -m pip check
 python - <<'PY'
 import importlib.metadata as md
@@ -100,10 +102,31 @@ ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest -q \
 
 ## 5. 真实模型启动
 
-以下以 8 张已分配 A2 卡为示例，沿用用户现有 INT checkpoint 路径；修改卡数时同步修改 TP。
-实机 SKU、HBM 和卡数尚未提供，因此此命令是待实测的容量起点，不是已测最优配置。
-约 155 GiB checkpoint 不能直接塞进 2×64 GB；8 卡静态权重平均约 19.4 GiB/卡，
-实际还需加复制权重、MLA 吸收、KV/SSM cache、工作区和通信 buffer，不能以文件体积证明不会 OOM。
+使用已确认的 **910B3，64 GB × 4，TP=4 + EP**，沿用用户现有 INT checkpoint 路径。
+NPU 0–3 是命令示例；若分配了其他卡，只替换可见设备列表，TP 仍为 4。
+EP 开启后 routed experts 按专家分配，其他可分片投影使用 TP；不是把每类权重一律除以 4。
+
+按此前报告的约 155 GiB 产物粗估，平均静态权重约 **38.75 GiB/卡**。
+若运行时每卡显示 64 GiB，`--gpu-memory-utilization 0.85` 的目标预算约 54.4 GiB/卡，
+相减约 15.65 GiB；这部分还需容纳不均匀/复制权重、MLA 吸收、KV/SSM cache、工作区、
+通信 buffer 和加载转换峰值，不能全部算作 KV cache。该参数也不是加载期显存硬上限。
+因此四卡可作为实测起点，尚不能保证不会 OOM；64 GB 的实际字节口径以运行时容量为准。
+如果使用的是此前提到的 200 GB+ 另一份产物，需重新计算，不能直接沿用 155 GiB 估算。
+
+启动前检查当前产物的实际大小，下面是粗略均摊值，不是运行时峰值预测：
+
+```bash
+MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-A5-W4A8-CT
+python - "$MODEL_PATH" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+index = json.loads((root / 'model.safetensors.index.json').read_text())
+files = sorted(set(index['weight_map'].values()))
+size = sum((root / name).stat().st_size for name in files)
+print(f'{len(files)} shards; {size / 2**30:.2f} GiB; file-average/4 = {size / 2**30 / 4:.2f} GiB')
+PY
+```
 
 先在 BF16 cache 下隔离 W/A 计算，再启用 C8。NoPE GLM 的 BF16 main-cache 会进入原生链路，
 速度及可用上下文与 C8 不同；若缓存阶段失败，应记录失败，不跳过权重数值验收。
@@ -112,13 +135,13 @@ ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest -q \
 cd /workspace
 MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-A5-W4A8-CT
 test -f "$MODEL_PATH/model.safetensors.index.json"
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 VLLM_USE_V2_MODEL_RUNNER=1 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve "$MODEL_PATH" \
   --served-model-name glm53-ct-a2 \
   --host 0.0.0.0 --port 8000 \
   --trust-remote-code --dtype bfloat16 \
   --quantization compressed-tensors \
-  --tensor-parallel-size 8 --enable-expert-parallel \
+  --tensor-parallel-size 4 --enable-expert-parallel \
   --kv-cache-dtype bfloat16 --attention-config.indexer_kv_dtype bf16 \
   --max-model-len 4096 --max-num-seqs 1 --max-num-batched-tokens 4096 \
   --gpu-memory-utilization 0.85 --enforce-eager \
@@ -135,6 +158,10 @@ vllm serve "$MODEL_PATH" \
 这是主 DSA INT8 与 KPool INT8 两个独立开关；`--kv-cache-dtype int8` 本身不表示 KPool 已为 INT8。
 先保持 eager、EP 和短上下文。再分别测试移除 `--enforce-eager`、flashcomm1、MTP、图文和长上下文，
 不要把多个未验证功能一次叠加来判断 W4A8 数值。
+若权重已成功加载而 profiling/cache 分配 OOM，先将 `--max-model-len` 和
+`--max-num-batched-tokens` 同时减至 2048，保持 batch1/eager；再记录各 rank 的
+`before_repack` / `after_repack` 和可用 HBM。加载转换阶段 OOM 需定位具体 rank、投影和分配量，
+缩短上下文并不能保证解决。确认通信、复制和峰值空间后再考虑调整显存利用率。
 
 ## 6. 请求与评测
 
@@ -173,7 +200,7 @@ CPU 验证基于固定的 vLLM 0.32 原生源码，非工作区旧 vLLM。独立
 | A2 GMM1/激活/GMM2 及 C8 算子 | 已提供实机测试，当前无 NPU，未执行 |
 | dummy / 真实模型请求、图文 | 未执行；dummy 不能替代真实权重验收 |
 | EP、ACLGraph、flashcomm1、MTP | 保留代码接口，待 A2 实机分别验证 |
-| 128k + batch16、吞吐及精度 | 无硬件容量及测量结果，未执行 |
+| 128k + batch16、吞吐及精度 | 已确认 4×64 GB，尚无实测容量及测量结果 |
 | A3 等价性 | A2 可验证功能链路，不能替代 A3 通信和性能验收 |
 
 当前交付为代码迁移和本地回归完成，真实模型部署验收待 A2 实机结果。
