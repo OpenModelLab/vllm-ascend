@@ -36,6 +36,7 @@ from vllm_ascend.models.glm5next.ops.kda import KDA_MAX_RECURRENT_TOKENS, chunk_
 from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBackend
 from vllm_ascend.ops.triton.kda.recoverssm import kda_recoverssm_verify
+from vllm_ascend.quantization.glm5next import is_glm_ct_int8_config
 
 
 def get_kda_parallel_size(parallel_config: ParallelConfig) -> int:
@@ -255,7 +256,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        # Legacy FP8 checkpoints omit KDA scales. Enable the CT INT profile
+        # explicitly below after initializing the GDN base without quantization.
         self.use_recoverssm = use_glm_recoverssm(vllm_config)
         saved_quant_config = vllm_config.quant_config
         try:
@@ -263,6 +265,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config
+        # The GDN base cached None on this instance. Restore the supported CT
+        # INT profile for GEMMs; the convolution modules below remain unquantized.
+        if is_glm_ct_int8_config(saved_quant_config):
+            self.quant_config = saved_quant_config
 
         if config.linear_head_dim != 128 or vllm_config.model_config.dtype != torch.bfloat16:
             raise ValueError("GLM AscendC KDA requires BF16 activations and head_dim=128.")

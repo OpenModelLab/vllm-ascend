@@ -80,6 +80,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_ascend.core.kv_cache_interface import MambaStateSharding
+from vllm_ascend.quantization.glm5next import glm5next_packed_mapping, is_glm_ct_int8_config
 from vllm_ascend.utils import pad_sequence_parallel_tokens
 
 from .attention import Glm5NextMLAAttention
@@ -198,6 +199,7 @@ class Glm5NextMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=self.router_dtype,
+            quant_config=quant_config if is_glm_ct_int8_config(quant_config) else None,
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
@@ -403,7 +405,9 @@ class Glm5NextDecoderLayer(nn.Module):
 
             self.n = n
 
-            # attn hc
+            # mHC is serialized as bare floating-point Parameters, even when
+            # the checkpoint's Linear modules use CT INT8. A broad CT target
+            # regex does not describe the storage of these non-Linear tensors.
             self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, d_model, dtype=torch.float32))
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
@@ -742,6 +746,9 @@ class Glm5NextModel(nn.Module):
     # Entries are (name, weight) or (name, weight, kwargs); the optional third
     # element carries per-weight loader arguments used by the fused FP8 paths.
     def load_weights(self, weights: Iterable[tuple[Any, ...]]) -> set[str]:
+        from vllm_ascend.quantization.compressed_tensors_packed import prepare_glm_packed_weights
+
+        weights = prepare_glm_packed_weights(self, weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
@@ -861,6 +868,10 @@ class Glm5NextModel(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
 
+                    if name.endswith((".hc_attn_fn", ".hc_ffn_fn")) and not loaded_weight.is_floating_point():
+                        raise ValueError(
+                            f"mHC requires a bare floating-point Parameter, got {name}: {loaded_weight.dtype}"
+                        )
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight, **kwargs)
@@ -870,6 +881,7 @@ class Glm5NextModel(nn.Module):
 
 class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, DeepseekV2MixtureOfExperts, IsHybrid):
     supports_replayssm: ClassVar[Literal[True]] = True
+    packed_modules_mapping = glm5next_packed_mapping()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -987,6 +999,8 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, DeepseekV2Mixtur
 )
 class Glm5NextForConditionalGeneration(Glm4vForConditionalGeneration, HasInnerState, IsHybrid):
     supports_replayssm: ClassVar[Literal[True]] = True
+    packed_modules_mapping = glm5next_packed_mapping(Glm4vForConditionalGeneration.packed_modules_mapping)
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
@@ -1065,13 +1079,9 @@ class Glm5NextForConditionalGeneration(Glm4vForConditionalGeneration, HasInnerSt
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
+                # Native FP8 checkpoints keep the tower BF16. CT INT profiles
+                # instead export INT8 vision projections with weight_scale.
+                quant_config=vllm_config.quant_config if is_glm_ct_int8_config(vllm_config.quant_config) else None,
                 prefix=maybe_prefix(prefix, "visual"),
                 input_norm=build_mm_input_norm(self.model_config),
             )

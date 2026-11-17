@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_ascend.ops.linear import AscendReplicatedLinear
@@ -52,6 +52,9 @@ class AscendGateLinear(GateLinear):
     params_dtype=torch.float32 / force_fp32_compute (e.g. MiniMax-M3), or
     via the Ascend-specific precast_fp32_weight path (DSV4), which the MoE
     runner routes around this forward entirely.
+
+    An explicit quant_config delegates quantized gates to their registered
+    linear method, bypassing the floating-point GEMM tiers and input casts.
     """
 
     def __init__(
@@ -72,6 +75,8 @@ class AscendGateLinear(GateLinear):
         # fp32 so the fallback tier computes in fp32.
         if force_fp32_compute:
             params_dtype = torch.float32
+        # Skip GateLinear.__init__ (CUDA/ROCm GEMM probes); weights follow
+        # the model dtype unless explicitly upcast.
         AscendReplicatedLinear.__init__(
             self,
             input_size,
@@ -86,8 +91,17 @@ class AscendGateLinear(GateLinear):
         # NPU default: fp32 logits when out_dtype is None (see class
         # docstring); out_dtype is immutable afterwards.
         self.out_dtype = out_dtype if out_dtype is not None else torch.float32
+        self.is_unquantized = isinstance(self.quant_method, UnquantizedLinearMethod)
 
     def forward(self, x: torch.Tensor):
+        if not self.is_unquantized:
+            # Keep floating inputs for the quantizer and honor the upstream
+            # tensor/tuple return contract, including return_bias=False.
+            result = ReplicatedLinear.forward(self, x)
+            if isinstance(result, tuple):
+                output, output_bias = result
+                return output.to(self.out_dtype), output_bias
+            return result.to(self.out_dtype)
         # Tier 4: bf16 x bf16 -> fp32 accumulation. Eligibility mirrors
         # upstream: bf16 weight (i.e. no fp32 upcast requested), fp32
         # out_dtype, no bias (torch.mm has no bias term).

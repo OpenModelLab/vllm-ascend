@@ -57,6 +57,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
+from vllm_ascend.quantization.glm5next import restore_ct_kv_b
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
     AscendW8A8LinearMethod,
@@ -918,14 +919,28 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # kv_b_proj is absorbed into W_UK/W_UV below and then disposed, so it never runs a
-        # matmul. What matters is that whichever quant method owns it left a dense weight
-        # behind; a quantized one would have replaced it with a layout we cannot split.
-        assert self.kv_b_proj.weight.dtype == act_dtype, (
-            f"SFA absorbs kv_b_proj and needs it dense in {act_dtype}, "
-            f"got {self.kv_b_proj.weight.dtype} from {type(self.kv_b_proj.quant_method).__name__}"
-        )
-        # NOTE: Weight will be reshaped next, we need to revert and transpose it.
-        kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T
+        # matmul. GLM CT explicitly restores codes/scales for this dense absorbed
+        # execution; other formats must already provide a floating-point matrix.
+        if (
+            getattr(self.kv_b_proj, "ct_restore_bf16_for_absorption", False)
+            and self.kv_b_proj.weight.dtype == torch.int8
+        ):
+            # CT's post-loader already transposed to [K,N]. Do not transpose
+            # again or discard the per-channel scale when restoring for SFA.
+            codes = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND)
+            kv_b_proj_weight = restore_ct_kv_b(codes, self.kv_b_proj.weight_scale, act_dtype)
+            logger.warning_once(
+                "GLM CT kv_b_proj is restored from INT8 codes and original scales to %s for SFA absorption; "
+                "this projection executes through floating-point MLA, not W8A8 GEMM.",
+                act_dtype,
+            )
+        else:
+            assert self.kv_b_proj.weight.dtype == act_dtype, (
+                f"SFA absorbs kv_b_proj and needs it dense in {act_dtype}, "
+                f"got {self.kv_b_proj.weight.dtype} from {type(self.kv_b_proj.quant_method).__name__}"
+            )
+            # Dense checkpoints keep [N,K], unlike CT's [K,N] post-load matrix.
+            kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
             self.local_num_heads * (self.qk_nope_head_dim + self.v_head_dim),

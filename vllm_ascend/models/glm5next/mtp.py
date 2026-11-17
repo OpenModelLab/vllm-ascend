@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -27,6 +28,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.triton.linearnorm.fused_eh_norm import fused_eh_norm
+from vllm_ascend.quantization.glm5next import glm5next_packed_mapping, is_glm_ct_int8_config
 from vllm_ascend.utils import is_rot_weight_used
 
 from .model import (
@@ -81,7 +83,16 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        if is_glm_ct_int8_config(quant_config):
+            self.eh_proj = ReplicatedLinear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.eh_proj",
+            )
+        else:
+            self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         # Reserve room for the incomplete pool tail and align the sparse MLA
         # buffer width to BLOCK_N=128.
@@ -131,6 +142,8 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
         )
         hidden_states = self.eh_proj(eh_input)
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         # Fuse the residual add and final RMSNorm. Glm5NextMoE already performs
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
@@ -140,6 +153,8 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
 
 class Glm5NextMultiTokenPredictor(nn.Module):
+    packed_modules_mapping = glm5next_packed_mapping()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -234,6 +249,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = glm5next_packed_mapping()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
@@ -328,6 +345,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.has_own_lm_head = own_head_weight in loaded_weights
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_ascend.quantization.compressed_tensors_packed import prepare_glm_packed_weights
+
+        weights = prepare_glm_packed_weights(self, weights)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),

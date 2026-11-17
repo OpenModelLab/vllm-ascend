@@ -34,6 +34,7 @@ from vllm_ascend.models.glm5next.kv_cache import (
     Glm5NextTailCache,
     get_kpool_tail_ring_capacity,
 )
+from vllm_ascend.quantization.glm5next import is_glm_ct_int8_config
 
 
 class Indexer(nn.Module):
@@ -81,9 +82,18 @@ class Indexer(nn.Module):
 
         # kpool
         self.index_kpool_compress_ape = nn.Parameter(torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32))
-        # Keep the checkpoint name ``index_kpool_compress_gate`` without a
-        # ``.weight`` suffix. torch.mm consumes its [head_dim, hidden_size] shape.
-        self.index_kpool_compress_gate = nn.Parameter(torch.empty(self.head_dim, hidden_size, dtype=torch.bfloat16))
+        # BF16 checkpoints keep a bare parameter. CT aliases the projection to
+        # *.weight and stores its INT8 codes plus per-channel scale separately.
+        if is_glm_ct_int8_config(quant_config):
+            self.index_kpool_compress_gate = ReplicatedLinear(
+                hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.index_kpool_compress_gate",
+            )
+        else:
+            self.index_kpool_compress_gate = nn.Parameter(torch.empty(self.head_dim, hidden_size, dtype=torch.bfloat16))
 
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
@@ -99,7 +109,7 @@ class Indexer(nn.Module):
             hidden_size,
             [self.head_dim, self.n_head],
             bias=False,
-            quant_config=None,
+            quant_config=quant_config if is_glm_ct_int8_config(quant_config) else None,
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
@@ -227,9 +237,12 @@ class Glm5NextMLAAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=None,  # kv_b_proj stays BF16 in the FP8 checkpoint
+            quant_config=quant_config if is_glm_ct_int8_config(quant_config) else None,
             prefix=f"{prefix}.kv_b_proj",
         )
+        # CT loads codes/scales natively, then SFA restores this projection to
+        # BF16 for absorption. This is an explicit execution-policy exception.
+        self.kv_b_proj.ct_restore_bf16_for_absorption = is_glm_ct_int8_config(quant_config)
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,

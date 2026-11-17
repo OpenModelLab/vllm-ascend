@@ -52,6 +52,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import get_current_hardware_profile
 from vllm_ascend.models.glm5next.processor import Glm5NextProcessorKwargs
+from vllm_ascend.quantization.glm5next import is_glm_ct_int8_config
 
 
 def _requires_2d_nz_input(layer: nn.Module) -> bool:
@@ -170,7 +171,9 @@ class Glm5NextVisionAttention(nn.Module):
             total_num_kv_heads=num_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj" if quant_config else f"{prefix}.qkv",
+            prefix=f"{prefix}.qkv"
+            if is_glm_ct_int8_config(quant_config)
+            else (f"{prefix}.qkv_proj" if quant_config else f"{prefix}.qkv"),
             disable_tp=use_data_parallel,
         )
         self.proj = RowParallelLinear(

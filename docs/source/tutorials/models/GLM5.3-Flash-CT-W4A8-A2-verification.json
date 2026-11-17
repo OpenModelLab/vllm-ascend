@@ -1,0 +1,210 @@
+{
+  "date": "2026-11-17",
+  "repository": "M:\\projects\\llm\\A2-vllm-ascend-0.32.0",
+  "origin": "https://github.com/vllm-project/vllm-ascend.git",
+  "branch": "releases/v0.32.0rc",
+  "base": "2dd5b2b2d2e22995821efeee8b0b265fcba5b612",
+  "main_port_source": "f2d258dc00b54549f986d6bdffb7160ae6091355",
+  "legacy_source_range": [
+    "528748a779ed62d150cf560bb55abf21883b8d66",
+    "52f9ae8238435016263c4ef91b31c6025ca5133f"
+  ],
+  "paired_vllm": {
+    "vllm_tag": "v0.32.0",
+    "commit": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+    "files": [
+      {
+        "path": "vllm/model_executor/layers/linear.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/linear.py",
+        "sha256": "7a9b90937865fa35d955ffc2017f23d3997bc4fba954e2667870b1b4854a38e0"
+      },
+      {
+        "path": "vllm/model_executor/layers/vocab_parallel_embedding.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/vocab_parallel_embedding.py",
+        "sha256": "10e17024bd5a5915e0d486e7a78a96d62e77bce803e1afd27feae7ad2042edc0"
+      },
+      {
+        "path": "vllm/model_executor/layers/fused_moe/routed_experts.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/fused_moe/routed_experts.py",
+        "sha256": "1a2e7324c831f3d48b77695acf2ca01694e5fcc8ac15bfb43e29ee57bd0734c9"
+      },
+      {
+        "path": "vllm/model_executor/layers/mamba/gdn/base.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/mamba/gdn/base.py",
+        "sha256": "e326cba09aceca3e247d0b51e6073240d04591ca433dbb20359c720167869fa0"
+      },
+      {
+        "path": "vllm/model_executor/layers/quantization/compressed_tensors/utils.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/quantization/compressed_tensors/utils.py",
+        "sha256": "e7c4b3b9d5bb2a6c7abfdb3f3546aafcebb4c1526250d13e3c90de8bda474f78"
+      },
+      {
+        "path": "vllm/model_executor/layers/quantization/utils/config_utils.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/quantization/utils/config_utils.py",
+        "sha256": "d99e06745c8b3a48d18d1a253e1ed616636002c2fa3f93a35b12bee86c644eb6"
+      },
+      {
+        "path": "vllm/model_executor/models/deepseek_v2.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/deepseek_v2.py",
+        "sha256": "96f4f755f62caa85869fb884209e7f8869882ddb6efbd40c930778b27bd3e39d"
+      },
+      {
+        "path": "vllm/model_executor/models/utils.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/utils.py",
+        "sha256": "4ab514070265ad06d8681f23c7976b726711f027fdf74dfcc3239c4b65bc1051"
+      },
+      {
+        "path": "vllm/model_executor/model_loader/weight_utils.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/model_loader/weight_utils.py",
+        "sha256": "a8fd6c258774406b4611474a351c1e64ac320cda21d9e8f10d648ebaf621f7b8"
+      },
+      {
+        "path": "vllm/model_executor/kernels/mhc/torch.py",
+        "url": "https://raw.githubusercontent.com/vllm-project/vllm/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/kernels/mhc/torch.py",
+        "sha256": "3697085aa6f0070e165c145f9c337ca3fe0623623c8265d29e50c43467e49985"
+      }
+    ]
+  },
+  "platform": "Windows local CPU; torch 2.14.1+cpu; pytest 9.1.1",
+  "cpu_test_items_passed": 99,
+  "native_loader_parameter_cases": 26,
+  "cpu_results": [
+    {
+      "name": "linears",
+      "command": [
+        "M:\\projects\\llm\\.venv-itersmooth\\Scripts\\python.exe",
+        "tests/ut/quantization/test_glm5next_ct_linears.py",
+        "--vllm-root",
+        "C:\\Users\\w30015592\\AppData\\Local\\Temp\\a2-vllm032-source"
+      ],
+      "returncode": 0,
+      "seconds": 32.66,
+      "test_items_passed": 26,
+      "log": "evidence/a2_ct_v032/linears.log",
+      "log_sha256": "c3318323b5c9c3a9df8b5741302ac1bd5aab6d319614bf6492c798993d8083da"
+    },
+    {
+      "name": "native_loader",
+      "command": [
+        "M:\\projects\\llm\\.venv-itersmooth\\Scripts\\python.exe",
+        "tests/ut/quantization/test_ct_native_loader_source.py",
+        "--vllm-root",
+        "C:\\Users\\w30015592\\AppData\\Local\\Temp\\a2-vllm032-source"
+      ],
+      "returncode": 0,
+      "seconds": 64.41,
+      "test_items_passed": 2,
+      "log": "evidence/a2_ct_v032/native_loader.log",
+      "log_sha256": "165387d929e3d91ae7dcd3c2a1b3cc3e3b33be9e24eb7cea0486c22ac7b47e2d"
+    },
+    {
+      "name": "loading_memory",
+      "command": [
+        "M:\\projects\\llm\\.venv-itersmooth\\Scripts\\python.exe",
+        "tests/ut/quantization/test_w4a8_loading_memory.py"
+      ],
+      "returncode": 0,
+      "seconds": 37.83,
+      "test_items_passed": 8,
+      "log": "evidence/a2_ct_v032/loading_memory.log",
+      "log_sha256": "11dc79c66d144cbaf6113932dd70839fea07a87fec97082013f92afa829c7119"
+    },
+    {
+      "name": "a5_isolation",
+      "command": [
+        "M:\\projects\\llm\\.venv-itersmooth\\Scripts\\python.exe",
+        "tests/ut/quantization/test_w4a8_a5_kcg.py"
+      ],
+      "returncode": 0,
+      "seconds": 35.77,
+      "test_items_passed": 16,
+      "log": "evidence/a2_ct_v032/a5_isolation.log",
+      "log_sha256": "e56c72ad8949b5f5469455609f16157cb4ff4950339b904387c7552a25cb0e85"
+    },
+    {
+      "name": "packed_boundary",
+      "command": [
+        "M:\\projects\\llm\\.venv-itersmooth\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "--confcutdir=tests/ut/quantization",
+        "-q",
+        "tests/ut/quantization/test_compressed_tensors_packed.py"
+      ],
+      "returncode": 0,
+      "seconds": 62.67,
+      "test_items_passed": 19,
+      "log": "evidence/a2_ct_v032/packed_boundary.log",
+      "log_sha256": "643b66d35b7e6f52256b47f5d95a6461ed4576f652ac67d98f25bbd73930edcb"
+    },
+    {
+      "name": "nope_prolog_cpu",
+      "command": [
+        "M:\\projects\\llm\\.venv-itersmooth\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "--confcutdir=tests/ut/attention",
+        "-q",
+        "tests/ut/attention/test_sfa_nope_prolog_cpu.py"
+      ],
+      "returncode": 0,
+      "test_items_passed": 28,
+      "log": "evidence/a2_ct_v032/nope_prolog_cpu.log",
+      "log_sha256": "8ed6387374043ce23ce4fd10bf804df730c7773fcf5e97ea0ce23cf65d159891",
+      "capture": "Exact output preserved from tool call; this group ran separately"
+    }
+  ],
+  "static_checks": {
+    "python_compile": 26,
+    "ruff": "0.14.0 check and format passed for 26 changed Python files",
+    "markdownlint": "markdownlint-cli 0.45.0 passed on tutorial and tutorial index",
+    "git_diff_check": "passed",
+    "git_fsck_connectivity_only": "passed",
+    "format_sh_ci": "not completed: pre-commit is not installed"
+  },
+  "hardware_validation": {
+    "A2_GMM1_activation_GMM2_8_cases": "not_run_no_NPU",
+    "C8_PoolKeyIndexer_INT8": "not_run_no_NPU",
+    "real_weights_generation": "not_run_no_NPU",
+    "dummy_generation": "not_run_no_NPU",
+    "EP_ACLGraph_flashcomm1_MTP_vision": "not_run_no_NPU",
+    "capacity_128k_batch16": "not_run_unknown_SKU_HBM_card_count",
+    "AISBench_3.1.20260630": "not_run_no_endpoint"
+  },
+  "policy": {
+    "A2_kernel": "native A8W4 NZ format 29 + encoded INT64 scales + correction bias; never A5 K-CG",
+    "kv_b_proj": "original codes times original scale restored to BF16 for absorption, user approved",
+    "mHC": "bare floating-point parameters, FP32 execution",
+    "C8": "existing 0.32 SFA INT8 and separate KPool INT8 flags; no offline cache rewriting"
+  },
+  "changed_files_sha256": {
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2.md": "8da60fc4023944b4f7fbaafa6ebed041db15feafac1076c8c819b667f55aa058",
+    "docs/source/tutorials/models/index.md": "ae532e52cc9536a06843eb945c74446a579eb09c4a5c801378e7eefbb548ba9f",
+    "tests/e2e/pull_request/one_card/test_ct_w4a8_loading.py": "f68d93c03dfb4427bcd58a5cbe144fae56e306fe205717488bf45c66288ec715",
+    "tests/e2e/pull_request/one_card/test_glm5next_ct_linears.py": "23d66f448b124994c787dd5ee6882b01ac323f5edb0ac8f23eb4c17cc9b0b6e4",
+    "tests/e2e/pull_request/one_card/test_glm5next_ct_special_projections.py": "3fd422e4c1c5670b9d52013e202ca4736cb4456430d2898b4293e18c5820f148",
+    "tests/e2e/pull_request/one_card/test_w4a8_a2_numeric.py": "af71632e6bde9c77366eedc79adea463da58a1ba69d47cc89b5c1fa2cd0c26bf",
+    "tests/e2e/pull_request/one_card/test_w4a8_a5_kcg.py": "9450cc482a5d28dc09fdbb5688b2745261546ebc65c0d55f34addbbd97c02137",
+    "tests/ut/quantization/configs/test_compressed_tensors_config.py": "fec795bba8631e9f878b7a3273b6010d8e6f1112186492eedc9142d50157449e",
+    "tests/ut/quantization/test_compressed_tensors_packed.py": "55ae4e097e29cca0192ce9e79ab8f9f52585122b6057f30910cebb1227c1f821",
+    "tests/ut/quantization/test_compressed_tensors_packed_loader.py": "79cdf6397bc9a3fc1120aa8413e24930ff4be4ccff8397ec545ce00709bdb2ed",
+    "tests/ut/quantization/test_ct_native_loader_source.py": "9860a1c81cfb94288ee614f46703be9698ff8cc3a0e8a8916cf6a04e939d2788",
+    "tests/ut/quantization/test_glm5next_ct_linears.py": "34e6aea7e5591e39090edd207a313e32b9160932db6f11350d6e0daf294ddb8e",
+    "tests/ut/quantization/test_w4a8_a5_kcg.py": "ea8eb9cadaeffb67d46cac56680d38da7e64551d5183a3a2e0c36a2a5989544f",
+    "tests/ut/quantization/test_w4a8_loading_memory.py": "f098a24f4335bff65f169c50236cae52050695d6844bce7c029490d120ace5a7",
+    "vllm_ascend/attention/indexer_kpool.py": "a1c89b2535019d5e43ed8a3200c3d02ad6c0c918fec6f084e3d11072756075e4",
+    "vllm_ascend/attention/sfa_v1.py": "5b6c893ae635d969ed1e6afc6fd59210d9735b26117524299fa0def15c1345c6",
+    "vllm_ascend/models/glm5next/attention.py": "c8172a8fe07633d8ad5cde5bf249994e86cdb9cf0ec215e9f747e897dc74ee77",
+    "vllm_ascend/models/glm5next/kda.py": "0133a17dce9893d5bb2711d9c13b149456eaabede40d17926145424887cf964a",
+    "vllm_ascend/models/glm5next/model.py": "6c1cf9d38a944a66d9221d4b8b3c0cbba7439fdacf8e38b35c6005b7ff07b64a",
+    "vllm_ascend/models/glm5next/mtp.py": "f39571c7cc6b0f03bc3d70448c620910e2d3197e51c7c0ff6cacebd5353a4bbc",
+    "vllm_ascend/models/glm5next/multimodal.py": "6248d29e1ae7878d6f2dbe1b92ca4d8ea29f1e040a854aedfa99597a22aa70c6",
+    "vllm_ascend/ops/fused_moe/gate_linear.py": "dce4040ff793eb32636e48144347263a999ce063cafe9ba0c318bfd0964ab9d6",
+    "vllm_ascend/quantization/compressed_tensors_packed.py": "ec8e47c504ecdd6de0733aa10c9c61f12c89af5c36d7df6ef3f70002ab6ea3a2",
+    "vllm_ascend/quantization/compressed_tensors_w4a8.py": "e7fa91907707149988b45dddab7c807baee8ef4d3fa919517d151ba23db7de69",
+    "vllm_ascend/quantization/compressed_tensors_w4a8_a5.py": "54548896c609ec7971a5125fb260d15629bdc7755b43791bd246373cf6002212",
+    "vllm_ascend/quantization/configs/compressed_tensors_config.py": "be5a7611d1e9eb1d3a10fd48dbb938865f972c729701e52cd1e20b8f629abf6c",
+    "vllm_ascend/quantization/glm5next.py": "4fe7d128d8e10a15dd22b4f9b3781c38770cbce59581181dcdf94b3e594f4c10",
+    "vllm_ascend/quantization/methods/w4a8/w4a8.py": "b3199977cbf28c3d6f4e5a4c227e58ad44c0941bd6e2266dd7e909a809326b46"
+  }
+}
