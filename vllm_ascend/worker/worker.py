@@ -116,6 +116,7 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
+from vllm_ascend.worker.startup import log_worker_startup
 
 # vLLM #61183 moved the planning helpers on main; v0.32.0 keeps them
 # in kv_cache_utils, so importing the main-only module breaks worker startup.
@@ -658,6 +659,7 @@ class NPUWorker(WorkerBase):
         return num_blocks * sum(spec.page_size_bytes for spec in plan.logical_cache_spec.values())
 
     @torch.inference_mode()
+    @log_worker_startup("memory_profile")
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -988,6 +990,7 @@ class NPUWorker(WorkerBase):
                 self.model_runner.get_model(),
             )
 
+    @log_worker_startup("compile_and_capture")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
@@ -1244,6 +1247,7 @@ class NPUWorker(WorkerBase):
                     break
         return num_layers, num_buffer_assignments, logical_page_bytes / physical_page_bytes
 
+    @log_worker_startup("kv_cache_spec")
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         extra_config = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
@@ -1312,6 +1316,7 @@ class NPUWorker(WorkerBase):
             return allocator.use_memory_pool(tag=tag)
         return nullcontext()
 
+    @log_worker_startup("kv_cache_allocate")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         speculator = getattr(self.model_runner, "speculator", None)

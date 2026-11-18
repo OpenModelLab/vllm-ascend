@@ -1,0 +1,76 @@
+{
+  "date": "2026-11-18",
+  "local_base": "22d5686c656c89acb76c43e8a7e4e98b2ce4fab1",
+  "reported_container_base": "24487f4f48ee99cf45d86d1c504e645549b8c1ef",
+  "official_main_checked": "92b6354a389e8652d67315215b022ab6be66529d",
+  "upstream_vllm_profile_source": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+  "root_cause_status": "Obsolete missing-symbol import and misleading warning confirmed; original FULL_DECODE_ONLY worker stall not yet proven or localized.",
+  "runtime_layout_status": "User-reported reorganized paths differ from tracked rc1 tree. Diagnostic script checks both layouts; live Worker stacks not supplied.",
+  "rc1_and_release_comparison": [
+    {
+      "path": "vllm_ascend/models/glm5next/kda.py",
+      "equal_rc1_and_release_base": true,
+      "sha256_rc1": "234a275b692473d89698c2ff4df4c2a2fdf0bb4c252c8acd4546c0264d5055ae"
+    },
+    {
+      "path": "vllm_ascend/models/glm5next/ops/causal_conv1d.py",
+      "equal_rc1_and_release_base": true,
+      "sha256_rc1": "969cf819fff395dab8f0ab62dbd82d500416c0581d9b5c5de620acd3ba7dbf30"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_triton.py",
+      "equal_rc1_and_release_base": true,
+      "sha256_rc1": "e46acf8d83e5895c38b0c3476fc608e4a64d228c09aa503f317cd1edbdf72681"
+    }
+  ],
+  "cpu_validation": {
+    "items_passed": 7,
+    "command": "python tests/ut/worker/test_glm5next_graph_startup_cpu.py",
+    "log_sha256": "b221186ad590a8f3eb9e954c9fa4b201333ef9dd5a7281560f4e914f66bcfb4b",
+    "scope": "CPU mocks/source execution; native FLA/NPU and graph runtime not executed"
+  },
+  "checks": {
+    "ruff_0_14_0": "passed",
+    "python_compile": 9,
+    "markdownlint_0_45_0": "passed",
+    "shell_syntax": "passed",
+    "format_sh_ci": "not completed: pre-commit is not installed"
+  },
+  "npu_validation": {
+    "native_conv_eager_and_graph_8_cases": "not_run_no_NPU",
+    "PIECEWISE_real_weights": "not_run_no_NPU",
+    "FULL_DECODE_ONLY": "not_run_no_NPU",
+    "GPQA_accuracy_or_performance": "not_run; user eager progress is not patch validation"
+  },
+  "source_snapshot_hashes": [
+    {
+      "file": "ascend_main_conv.py",
+      "sha256": "2a1b3a6323546236c868e1c1e668ff68b57fd0b1984908ea8bdd47d3a3b4a60f"
+    },
+    {
+      "file": "ascend_main_patch.py",
+      "sha256": "851e90873eccf059bab82cd5eeb64a2ebd8508cb8d99a32d9f38dfe6c79b34e3"
+    },
+    {
+      "file": "vllm_interfaces.py",
+      "sha256": "fdccd96b0cf623186094efcfa3eb08d6197f34a6468304f66e6eb5e67bc76f41"
+    },
+    {
+      "file": "vllm_model_runner.py",
+      "sha256": "5240fe8d62d403e466a4aa07a28fb7af5c0f1e9b9c3bb08c4003185bde461f87"
+    }
+  ],
+  "files_sha256": {
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2-Graph.md": "e0411ca540f0b71d353129d6ccc3b6be215b97c3204b54ddb437b87515e6053b",
+    "docs/source/tutorials/models/index.md": "a22a902e0b69bf078787ec3fe97a7b743a4ed1ac90601798924be9152f73b17b",
+    "examples/diagnose_glm5next_graph.py": "00cf8bd9db513d7090e8668561a3b1be3a5afb034b744084ebbff3e2a1a45796",
+    "tests/e2e/pull_request/one_card/test_glm5next_conv_aclgraph.py": "3369edc38264ecff5ac0c4a72c6237422c21c18b516b731383c2703a8044471b",
+    "tests/ut/worker/test_glm5next_graph_startup_cpu.py": "615f84b622194608af88218905120b57bdc3f35301060972b6bf3fba7cabee31",
+    "vllm_ascend/patch/__init__.py": "625d5c7ffea9669f75f5d7112e60ea67d1d9f8505862b674338cdde160289e70",
+    "vllm_ascend/patch/worker/__init__.py": "bddfdc6ce85d80561674f3bc29d59ccd46fca55f140f58adee8ad412d2cfb262",
+    "vllm_ascend/patch/worker/patch_ascend_ops.py": "48a4ec6e3f55ea6c04bf3726acf3874360314fd081549f1c45855992f83d64a0",
+    "vllm_ascend/patch/worker/patch_triton.py": "e8a5cc2d7e3d8f4519cc1fa945663227eb8c240f45c4f9707d52cd73c5708560",
+    "vllm_ascend/worker/startup.py": "088023bc026239ca69708990339f5462114cf4b48e1ca9815027d8717fbbc266",
+    "vllm_ascend/worker/worker.py": "7f318179539f3a40c2b976fc7098fc0fdc824259836b0dc5678144ee2762d70a"
+  }
+}
