@@ -4,8 +4,8 @@
   "reported_container_base": "24487f4f48ee99cf45d86d1c504e645549b8c1ef",
   "official_main_checked": "92b6354a389e8652d67315215b022ab6be66529d",
   "upstream_vllm_profile_source": "5df63a7203cdb9328d824a27b682e77c7b9928be",
-  "root_cause_status": "Obsolete missing-symbol import and misleading warning confirmed; original FULL_DECODE_ONLY worker stall not yet proven or localized.",
-  "runtime_layout_status": "User-reported reorganized paths differ from tracked rc1 tree. Diagnostic script checks both layouts; live Worker stacks not supplied.",
+  "root_cause_status": "GLM native FLA path confirmed in actual container; obsolete warning is unrelated. FLA varlen max_query_len compatibility defect fixed locally; FULL_DECODE_ONLY startup stall remains unlocalized without Worker stacks/NPU results.",
+  "runtime_layout_status": "User corrected earlier report: tracked models/glm5next/kda.py uses its native ops/causal_conv1d.py wrapper and fla_npu.ops.ascendc; ops/layers tree claim withdrawn.",
   "rc1_and_release_comparison": [
     {
       "path": "vllm_ascend/models/glm5next/kda.py",
@@ -24,14 +24,14 @@
     }
   ],
   "cpu_validation": {
-    "items_passed": 7,
+    "items_passed": 11,
     "command": "python tests/ut/worker/test_glm5next_graph_startup_cpu.py",
-    "log_sha256": "b221186ad590a8f3eb9e954c9fa4b201333ef9dd5a7281560f4e914f66bcfb4b",
+    "log_sha256": "b8fafbd49da9fbb36886b0d4436385029c7b2f24ef24a61f34bd23d5227ffecd",
     "scope": "CPU mocks/source execution; native FLA/NPU and graph runtime not executed"
   },
   "checks": {
     "ruff_0_14_0": "passed",
-    "python_compile": 9,
+    "python_compile": 12,
     "markdownlint_0_45_0": "passed",
     "shell_syntax": "passed",
     "format_sh_ci": "not completed: pre-commit is not installed"
@@ -61,16 +61,51 @@
     }
   ],
   "files_sha256": {
-    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2-Graph.md": "e0411ca540f0b71d353129d6ccc3b6be215b97c3204b54ddb437b87515e6053b",
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2-Graph.md": "a2cf260f376e092c55a2a69c0d030a515036a960e3502fcfb933f8e9537ee018",
     "docs/source/tutorials/models/index.md": "a22a902e0b69bf078787ec3fe97a7b743a4ed1ac90601798924be9152f73b17b",
-    "examples/diagnose_glm5next_graph.py": "00cf8bd9db513d7090e8668561a3b1be3a5afb034b744084ebbff3e2a1a45796",
-    "tests/e2e/pull_request/one_card/test_glm5next_conv_aclgraph.py": "3369edc38264ecff5ac0c4a72c6237422c21c18b516b731383c2703a8044471b",
-    "tests/ut/worker/test_glm5next_graph_startup_cpu.py": "615f84b622194608af88218905120b57bdc3f35301060972b6bf3fba7cabee31",
+    "examples/diagnose_glm5next_graph.py": "dedc1e67a8f4bafcd3b828732d812139e49c3665e879e21a07c3c38e8daf3a33",
+    "tests/e2e/pull_request/one_card/test_glm5next_conv_aclgraph.py": "a98e6ea58b8be32e16755351212e057eacccf922ea6ef24ddf97be14179b3478",
+    "tests/ut/worker/test_glm5next_graph_startup_cpu.py": "edb4eb2f2e066a981f0921bc23447f0e3fc5196929e5cb25b2f48ad27c4c7d34",
+    "vllm_ascend/models/glm5next/kda.py": "f10d7bcf683ea1649abd66618b424b90534ac1ee4456dfcf964e75b9e2e8739e",
+    "vllm_ascend/models/glm5next/ops/causal_conv1d.py": "22b74b3f1556b881c3c9c1b7fb3c22ebcd7fe8e8c44aa78241216b6580cfde0c",
     "vllm_ascend/patch/__init__.py": "625d5c7ffea9669f75f5d7112e60ea67d1d9f8505862b674338cdde160289e70",
     "vllm_ascend/patch/worker/__init__.py": "bddfdc6ce85d80561674f3bc29d59ccd46fca55f140f58adee8ad412d2cfb262",
     "vllm_ascend/patch/worker/patch_ascend_ops.py": "48a4ec6e3f55ea6c04bf3726acf3874360314fd081549f1c45855992f83d64a0",
     "vllm_ascend/patch/worker/patch_triton.py": "e8a5cc2d7e3d8f4519cc1fa945663227eb8c240f45c4f9707d52cd73c5708560",
     "vllm_ascend/worker/startup.py": "088023bc026239ca69708990339f5462114cf4b48e1ca9815027d8717fbbc266",
+    "vllm_ascend/worker/v2/model_runner.py": "e706a107fa63e1c3553a9256cb194602d256865b147aed0c7c9f575f0343839a",
     "vllm_ascend/worker/worker.py": "7f318179539f3a40c2b976fc7098fc0fdc824259836b0dc5678144ee2762d70a"
+  },
+  "followup_base": "c234f8abe5c90292644ff0cbfc4e26a782dfcfcf",
+  "installed_fla_user_report": {
+    "distribution": "flash-linear-attention-npu-a2",
+    "version": "26.9.1",
+    "public_api_has_max_query_len": true,
+    "default_max_query_len": -1,
+    "public_api_has_validate_data": true,
+    "default_validate_data": false,
+    "source_file": "/usr/local/python3.12.16/lib/python3.12/site-packages/fla_npu/ops/ascendc/__init__.py",
+    "inspect_getsource_result": "_get_direct_op dispatcher, not proof of selected backend",
+    "installed_file_hashes": "not supplied"
+  },
+  "fla_source_review": {
+    "repository": "https://github.com/flashserve/flash-linear-attention-npu",
+    "tag": "v26.9.1-release",
+    "commit": "5cc699069c7f91a35aabd583032c8720a0b626fa",
+    "files_sha256": {
+      "torch_custom/fla_npu/fla_npu/ops/ascendc/__init__.py": "65f3e866e852b6f2fb9a8624d16b4c192e4b82b051e55e087c698849a5eb1656",
+      "torch_custom/fla_npu/fla_npu/ops/ascendc/_stable.py": "909075ff2b52a715202f61654e0dec2f9a0bc026f4a77ed39a28e778a60c1f4c",
+      "torch_custom/fla_npu/fla_npu/ops/ascendc/_aclnn_ctypes.py": "b9d5893db66409c2601cc5d86e7197052a179f5f1c9ee83cd844151d43b9e34d",
+      "torch_custom/fla_npu/csrc/src/stable_causal_conv1d_common.cpp": "e698ede2638357d701386ac70af14b53e86d430187993903a7c11c96d346135c",
+      "torch_custom/fla_npu/csrc/include/stable/exec.h": "dd6df45130ae760a47f7844874b120c226b9dbea0d317f120908d6cd4d0a72d7",
+      "fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_validation.h": "cee9601a88c797c89779986f657a599ebf03ab98791ef8e989522999bc84f858"
+    },
+    "findings": [
+      "GLM convolution wrapper uses tensor shape/stride only, no device scalar/list reads.",
+      "FLA ctypes varlen update requires nonnegative max_query_len; device metadata value reads are guarded by validate_data.",
+      "KDA now passes 1 for plain decode and num_spec+1 for spec verification. Standalone spec bound is capped by per-request rollback-state capacity.",
+      "Stable update and recurrent KDA call _current_stream_ptr; possible task-queue barriers require runtime stack confirmation, not replacement with an unordered stream accessor.",
+      "Static source review cannot prove CANN kernels or HCCL support full capture."
+    ]
   }
 }

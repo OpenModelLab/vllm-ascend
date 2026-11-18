@@ -112,6 +112,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
+from vllm_ascend.worker.startup import log_worker_startup
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
@@ -681,6 +682,7 @@ class NPUModelRunner(GPUModelRunner):
             layer.impl.bind_copy_sfa_kv_cache(manager, layer_name)
 
     @torch.inference_mode()
+    @log_worker_startup("graph_capture")
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture decoder and multimodal encoder graphs on Ascend."""
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
@@ -835,6 +837,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
+    @log_worker_startup("profile_forward")
     def profile_run(self, randomize_inputs: bool = False) -> None:
         """Override GPUModelRunner.profile_run for Ascend NPUs.
         When running moe models, we need an extra dummy run with mc2_tokens_capacity tokens to reserve

@@ -19,10 +19,9 @@ Glm5NextLinearAttention._forward_core
 
 它不使用上述 generic upstream rebind。多模态能力和 KDA/SSM 是模型的两个结构特征，
 不能从“多模态模型”推导它走通用 Mamba 卷积 fallback。
-以上调用链已在本地官方 `24487f4f4` 源码核实。用户随后提供的变更清单包含
-`modeling_glm5next.py`、`ops/layers/attention/kda.py` 和重构后的量化目录，
-与本地该提交的 tracked tree 不同；容器若使用另一套覆盖文件，需以实际绑定和源码为准。
-诊断脚本同时尝试这两套 KDA 路径，不能只根据 HEAD 或 WARNING 推断运行路径。
+以上调用链已在本地官方 `24487f4f4` 源码核实；用户最新返回的容器 `git ls-tree` 和 grep
+也已确认这一调用链。此前包含 `modeling_glm5next.py`、`ops/layers/attention/kda.py`
+的报告已被用户撤回。当前无需实现不存在的通用 Triton 函数。
 
 `EngineCore → wait_for_ready → selectors.select` 只说明在等 Worker。
 报告的 WatchDog 时间 11:25:57 早于 12:09:22 权重后处理完成，需要按同一轮启动的 PID、时间戳核对。
@@ -56,12 +55,59 @@ Glm5NextLinearAttention._forward_core
 
 删除 WARNING 只修复错误诊断，不等于证明启动卡死已消失。真正阻塞点以 Worker 栈和新增阶段日志为准。
 
+## 对实际 FLA 路径的进一步检查
+
+本次另行只读克隆了官方 FLA `v26.9.1-release`，固定提交
+`5cc699069c7f91a35aabd583032c8720a0b626fa`。这是镜像 Dockerfile 指定版本对应的源码，
+用户随后返回的实际包版本也是 `26.9.1`，公开函数签名包含 `max_query_len=-1`。
+`inspect.getsource()` 因 `functools.wraps` 返回分发层 `_get_direct_op`，不能据此认定已经看到了
+实际选中的 Stable/ctypes 函数体。版本相同也不代替安装文件 hash 核对；没有安装或升级任何依赖。
+
+| 检查位置 | 源码结论 |
+| --- | --- |
+| GLM 原生卷积 wrapper | 没有 `.item()` / `.cpu()` / `.tolist()`；状态布局判断使用 shape/stride |
+| FLA ctypes 卷积 update | `validate_data=False` 为默认值，读取设备元数据的 helper 只在数据校验分支调用；不能把文本搜索命中当成默认同步 |
+| FLA Stable ABI update/recurrent KDA | 未见这两个 Python 入口直接读取设备 tensor 数值；stream 获取可能经过任务队列 barrier，仍需实际版本和 Worker 栈判断 |
+| GLM KDA、SFA、indexer | 找到的 `bool(...is_prefilling_np.any())` 使用 NumPy 元数据；没有定位到每请求设备 `.item()` 的证据 |
+| GDN metadata builder | 多处 `.item()` / `.tolist()` 使用 CPU draft tokens / query starts；构造 metadata 与图内算子执行要区分 |
+| Mamba hybrid `num_scheduled_tokens.max().item()` | 上游字段类型是 `np.ndarray`，属于 CPU 标量提取，不能当作 NPU 同步 |
+
+发现并修复一个独立的 FLA 接口问题：26.9.1 的 ctypes update 在传入 `query_start_loc` 时要求
+非负 `max_query_len`，而原 GLM wrapper 未传。Stable 路径也把该上界传给 tiling。
+新 wrapper 在导入时检查函数签名，仅在支持时传参，旧接口保持原调用。
+KDA 普通 decode 传 `1`，MTP 验证传 `self.num_spec + 1`，都是已有 CPU 配置值。
+独立调用未指定上界时使用输入行数；如果带 accepted tokens，则再用卷积 state 长度和 kernel width
+推导每请求 rollback 容量上界。不能直接对 MTP 使用整批 token 数，否则 FLA 会错误要求每个请求
+都分配整批长度的历史槽。没有用 `query_start_loc.max().item()` 获取长度。
+它修复确定的接口风险，尚不能据此认定当前 eager 可用、FULL 卡住的直接原因就是漏传参数。
+
+`profile_forward` 和 `graph_capture` 两个 MRV2 阶段已另加开始/结束日志。
+若停在 `profile_forward`，内存 profile 的 `skip_attn=True` 会使 KDA core 在缺少 metadata 时直接归零，
+此时优先检查投影、MoE、视觉 profile、编译和集合通信，而不是预设已经调用了 decode 卷积。
+FLA Python 没有显式同步也不能证明其 CANN kernel、任务队列或多卡路径支持 capture。
+
 ## 当前评测完成后再操作
 
 保持正在运行的 eager GPQA 评测。本次本地修改不连接或重启节点服务。
 以下命令由用户在本轮评测结束后，在本人的容器中执行。
 
 ### 1. 核对安装绑定
+
+先执行纯源码采集，不导入 Torch、FLA 或模型，不创建 NPU context；可在当前 GPQA 继续运行时执行：
+
+```bash
+cd /vllm-workspace/vllm-ascend
+python examples/diagnose_glm5next_graph.py --source-only \
+  --output /mnt/share/w30015592/tmp/glm53_fla_sources.json \
+  > /mnt/share/w30015592/tmp/glm53_fla_sources.stdout.json
+```
+
+输出包括已安装 FLA distribution 的版本、Python 源码 SHA256、关键函数正文和潜在 host-read 行，
+保留校验分支上下文。这是静态候选清单，不能把某个 `.cpu()` 命中直接判为活跃捕获路径。
+脚本记录的 FLA 环境变量属于新进程，不代替原 Worker 的实际环境。
+若 wheel 没有文件清单或 Python 源码，输出为空/错误，不伪造调用结果。
+
+评测结束后再做会导入实际设备库的绑定检查：
 
 ```bash
 cd /vllm-workspace/vllm-ascend
@@ -84,11 +130,13 @@ eager / capture，每次回放前改变输入、恢复初始 state，并与独�
 cd /vllm-workspace/vllm-ascend
 set -o pipefail
 ASCEND_RT_VISIBLE_DEVICES=0 timeout --signal=TERM --kill-after=10s 180s \
-  python -m pytest -q -v tests/e2e/pull_request/one_card/test_glm5next_conv_aclgraph.py \
+  python -u -m pytest -q -v -s tests/e2e/pull_request/one_card/test_glm5next_conv_aclgraph.py \
   2>&1 | tee /mnt/share/w30015592/tmp/glm53_conv_graph_probe.log
 ```
 
 超时、失败和 skip 均不能算图模式验收通过。
+探针输出真实执行后 FLA 的 `BACKENDS` / `FALLBACKS`（如果该安装提供这些字段）以及 warmup/capture 边界；
+可区分首次 native launch 就停住与仅 capture 停住，后者才继续针对捕获检查。
 只有 capture 用例失败，才直接证明当前 FLA/CANN 的这个卷积/状态布局捕获存在问题；
 测试通过也不能证明整个模型或多卡 HCCL 图捕获正确。
 
@@ -149,14 +197,16 @@ python /vllm-workspace/vllm-ascend/examples/diagnose_glm5next_graph.py \
 | --- | --- |
 | `kv_cache_spec` | cache-spec / 混合页大小规划；尚不能判断已捕获图 |
 | `memory_profile` | 视觉 profile、text dummy run、编译或同步；比较 skip-mm-profiling 和 Worker 栈 |
+| `profile_forward` | MRV2 的实际 profile 入口；尚不能认定已进入图捕获 |
 | `kv_cache_allocate` | KV/SSM 分配、connector 和 cache 初始化 |
 | `compile_and_capture` | warmup、自定义 kernel 预热、真实捕获；需结合捕获开始日志与 Worker 栈 |
+| `graph_capture` | MRV2 capture 入口已进入，结合卷积探针和 Worker 栈定位具体算子/通信 |
 
 ## 验证边界
 
 本次只能运行本地 CPU 回归和语法/格式检查；NPU 卷积、PIECEWISE、FULL_DECODE_ONLY、
 真实权重首请求及 GPQA 图/eager 精度对照均未在节点执行。
-本地 7 项 CPU 回归通过，9 个 Python 文件编译和固定 Ruff 检查通过；
+本地 11 项 CPU 回归通过，12 个 Python 文件编译和固定 Ruff 检查通过；
 详细文件校验值见[验证记录](GLM5.3-Flash-CT-W4A8-A2-Graph-verification.json)。
 完整 `format.sh ci` 因缺少 pre-commit 未完成。
 现有 eager GPQA 的 115.2 tok/s 是用户提供的评测进度，未作为本补丁图模式的性能结果。

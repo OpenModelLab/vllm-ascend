@@ -4,6 +4,7 @@
 import pytest
 import torch
 import torch_npu  # noqa: F401
+from fla_npu.ops import ascendc
 
 from vllm_ascend.models.glm5next.ops.causal_conv1d import causal_conv1d
 
@@ -26,17 +27,25 @@ def test_native_glm_conv_eager_and_graph_replay(capture, dim, dim_first):
     output = torch.zeros_like(x)
 
     def run():
-        return causal_conv1d(x, weights, state, starts, slots, run_mode=1, output_buffer=output)
+        return causal_conv1d(x, weights, state, starts, slots, run_mode=1, output_buffer=output, max_query_len=1)
 
     # Warm up native kernels and any state-copy Triton specialization first.
+    print(f"GLM native conv warmup begin capture={capture} dim={dim} dim_first={dim_first}", flush=True)
     run()
     run()
     torch.npu.synchronize()
+    print(
+        f"GLM native conv warmup end FLA backends={getattr(ascendc, 'BACKENDS', 'unavailable')} "
+        f"fallbacks={getattr(ascendc, 'FALLBACKS', 'unavailable')}",
+        flush=True,
+    )
     graph = None
     if capture:
         graph = torch.npu.NPUGraph()
+        print("GLM native conv capture begin", flush=True)
         with torch.npu.graph(graph):
             run()
+        print("GLM native conv capture end", flush=True)
     for step in range(2):
         current = (inputs_cpu.float() + step / 4).bfloat16()
         x.copy_(current)

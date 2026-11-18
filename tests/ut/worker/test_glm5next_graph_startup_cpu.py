@@ -6,6 +6,7 @@ import importlib.util
 import inspect
 import logging
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -135,6 +136,51 @@ class TestGLMConvolutionBinding(unittest.TestCase):
         self.assertEqual(kwargs["out"].data_ptr(), output.data_ptr())
         self.assertTrue(torch.equal(output[2:], torch.zeros_like(output[2:])))
 
+    def test_legacy_update_does_not_receive_new_keyword(self):
+        self.test_decode_uses_native_ascendc_without_generic_triton_binding()
+        self.assertFalse(self.conv._UPDATE_HAS_MAX_QUERY_LEN)
+        self.assertNotIn("max_query_len", self.native.causal_conv1d_update.call_args.kwargs)
+
+    def test_varlen_update_supplies_shape_bound_without_reading_device_values(self):
+        calls = Mock()
+
+        def update(x, state, weight, *, max_query_len=-1, out, **kwargs):
+            calls(max_query_len=max_query_len, **kwargs)
+            if max_query_len < 0:
+                raise ValueError("max_query_len is required for varlen update")
+            if state.shape[1] < weight.shape[0] - 1 + max_query_len - 1:
+                raise ValueError("per-request speculative state capacity is insufficient")
+            return out.copy_(x)
+
+        self.native.causal_conv1d_update = update
+        conv = load_source("glm_bound_conv_under_test", ROOT / "vllm_ascend/models/glm5next/ops/causal_conv1d.py")
+        self.assertTrue(conv._UPDATE_HAS_MAX_QUERY_LEN)
+        # Packed requests with lengths 2, 0, 3 (including padding), as in
+        # speculative verification. A whole-batch bound of 5 would exceed
+        # each request's rollback capacity; the valid configured bound is 3.
+        x = torch.ones(5, 16)
+        starts = torch.tensor([0, 2, 2, 5])
+        slots = torch.tensor([1, 0, 2])
+        accepted = torch.tensor([1, 1, 2])
+        with (
+            patch.object(torch.Tensor, "item", side_effect=AssertionError("host scalar read")),
+            patch.object(torch.Tensor, "cpu", side_effect=AssertionError("device-to-host copy")),
+            patch.object(torch.Tensor, "tolist", side_effect=AssertionError("host list read")),
+        ):
+            conv.causal_conv1d(
+                x,
+                torch.ones(4, 16),
+                torch.zeros(4, 5, 16),
+                starts,
+                slots,
+                run_mode=1,
+                num_accepted_tokens=accepted,
+                output_buffer=torch.zeros_like(x),
+            )
+        self.assertEqual(calls.call_args.kwargs["max_query_len"], 3)
+        self.assertIs(calls.call_args.kwargs["query_start_loc"], starts)
+        self.assertIs(calls.call_args.kwargs["num_accepted_tokens"], accepted)
+
 
 class TestGLMGraphDispatch(unittest.TestCase):
     def test_piecewise_and_full_use_their_respective_output_contracts(self):
@@ -160,6 +206,38 @@ class TestGLMGraphDispatch(unittest.TestCase):
                 self.assertTrue(torch.equal(result, torch.full_like(hidden, 8 if piecewise else 6)))
                 self.assertEqual(hooks.glm5next_kda_forward_with_output.call_count, int(piecewise))
                 self.assertEqual(hooks.glm5next_kda_forward.call_count, int(not piecewise))
+
+
+class TestInstalledFLASourceReport(unittest.TestCase):
+    def setUp(self):
+        self.probe = load_source("glm_graph_probe_under_test", ROOT / "examples/diagnose_glm5next_graph.py")
+
+    def test_source_only_does_not_import_model_or_device_modules(self):
+        with (
+            patch.object(self.probe, "_git", return_value={}),
+            patch.object(self.probe, "collect_fla_sources", return_value={"fixture": {"version": "26.9.1"}}),
+            patch.object(self.probe.importlib, "import_module", side_effect=AssertionError("runtime import")),
+        ):
+            report = self.probe.collect([], source_only=True)
+        self.assertEqual(report["bindings"], {})
+        self.assertIsNone(report["vllm_root"])
+        self.assertEqual(report["fla_sources"]["fixture"]["version"], "26.9.1")
+
+    def test_source_report_preserves_validation_guard_and_api_signature(self):
+        source = (
+            "def npu_causal_conv1d_update(x, *, max_query_len=-1, validate_data=False):\n"
+            "    if validate_data:\n"
+            "        return x.cpu().tolist()\n"
+            "    return x\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "_aclnn_ctypes.py"
+            path.write_text(source, encoding="utf-8")
+            report = self.probe._source_report(path)
+        function = report["functions"]["npu_causal_conv1d_update"]["source"]
+        self.assertIn("max_query_len=-1", function)
+        self.assertIn("if validate_data:", function)
+        self.assertEqual(report["possible_host_reads"], ["3: return x.cpu().tolist()"])
 
 
 if __name__ == "__main__":
