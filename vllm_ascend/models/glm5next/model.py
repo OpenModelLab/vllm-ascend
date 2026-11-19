@@ -80,7 +80,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_ascend.core.kv_cache_interface import MambaStateSharding
-from vllm_ascend.quantization.glm5next import glm5next_packed_mapping, is_glm_ct_int8_config
+from vllm_ascend.quantization.glm5next import glm5next_packed_mapping
 from vllm_ascend.utils import pad_sequence_parallel_tokens
 
 from .attention import Glm5NextMLAAttention
@@ -199,7 +199,6 @@ class Glm5NextMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=self.router_dtype,
-            quant_config=quant_config if is_glm_ct_int8_config(quant_config) else None,
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
@@ -590,6 +589,7 @@ class Glm5NextModel(nn.Module):
         config = vllm_config.model_config.hf_text_config
         _validate_supported_config(config)
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
@@ -1079,9 +1079,8 @@ class Glm5NextForConditionalGeneration(Glm4vForConditionalGeneration, HasInnerSt
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # Native FP8 checkpoints keep the tower BF16. CT INT profiles
-                # instead export INT8 vision projections with weight_scale.
-                quant_config=vllm_config.quant_config if is_glm_ct_int8_config(vllm_config.quant_config) else None,
+                # MLP-only CT and native FP8 checkpoints keep vision floating.
+                quant_config=None,
                 prefix=maybe_prefix(prefix, "visual"),
                 input_norm=build_mm_input_norm(self.model_config),
             )

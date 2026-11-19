@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU regression for GLM CT construction, scale loading and integer execution.
+"""CPU regression for GLM MLP-only CT loading and floating projections.
 
 Execute directly with --vllm-root PATH. Runtime imports/distributed state are
 isolated; constructors/loaders/quant methods are selected from actual sources.
@@ -252,7 +252,10 @@ def runtime(vllm_root):
     spec = importlib.util.spec_from_file_location("glm_ct_contract", helper_path)
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    scope.update(is_glm_ct_int8_config=helper.is_glm_ct_int8_config)
+    scope.update(
+        is_glm_ct_int_config=helper.is_glm_ct_int_config,
+        prepare_glm_mlp_weights=helper.prepare_glm_mlp_weights,
+    )
     scope["get_replicated_op"] = lambda *args: (None, state.rank, state.world)
     execute_nodes(
         ROOT / "vllm_ascend/ops/linear.py",
@@ -403,8 +406,6 @@ def runtime(vllm_root):
 
     scope["torch_npu"] = IntegerBackend
     scope.update(
-        ct_kpool_input=helper.ct_kpool_input,
-        ct_kpool_selectors=helper.ct_kpool_selectors,
         F=torch.nn.functional,
         Glm5NextIndexerCache=lambda **kw: torch.nn.Module(),
         Glm5NextTailCache=lambda **kw: torch.nn.Module(),
@@ -467,7 +468,6 @@ def runtime(vllm_root):
         scope,
     )
     scope.update(
-        restore_ct_kv_b=helper.restore_ct_kv_b,
         ACL_FORMAT_FRACTAL_ND=2,
         replace_parameter=lambda obj, name, value, **kw: setattr(obj, name, value),
         dispose_layer=lambda layer: setattr(layer, "disposed", True),
@@ -515,8 +515,9 @@ def config(rt, ignore=()):
 
     result = rt.scope["AscendCompressedTensorsConfig"](
         {
-            r"re:.*\.experts\.\d+\.(gate|up|down)_proj$": scheme(4, "pack-quantized"),
-            r"re:^(?!.*\.experts\.\d+\.).*$": scheme(8, "int-quantized"),
+            r"re:.*\.mlp\.experts\.\d+\.(gate|up|down)_proj$": scheme(4, "pack-quantized"),
+            r"re:.*\.mlp\.(gate|up|down)_proj$": scheme(8, "int-quantized"),
+            r"re:.*\.mlp\.shared_experts\.(gate|up|down)_proj$": scheme(8, "int-quantized"),
         },
         list(ignore),
         "mixed-precision",
@@ -537,219 +538,200 @@ class TestGlmCTLinears(unittest.TestCase):
     def setUp(self):
         self.rt.state.rank, self.rt.state.world = 0, 1
 
-    def test_kv_b_native_tp_load_and_bf16_absorption_with_original_scales(self):
+    def indexer_model(self):
         rt = self.rt
-        codes = (torch.arange(32 * 8).reshape(32, 8) % 255 - 127).to(torch.int8)
-        scales = ((torch.arange(32) + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-        for world in (1, 2, 4):
-            rt.state.world = world
-            for rank in range(world):
-                rt.state.rank = rank
-                attn = rt.scope["Glm5NextMLAAttention"](
-                    SimpleNamespace(),
-                    SimpleNamespace(rms_norm_eps=1e-5),
-                    16,
-                    4,
-                    4,
-                    0,
-                    4,
-                    16,
-                    8,
-                    quant_config=config(rt),
-                    prefix="layers.11.self_attn",
-                )
-                layer = attn.kv_b_proj
-                self.assertTrue(layer.ct_restore_bf16_for_absorption)
-                model = rt.scope["Glm5NextModel"]()
-                model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
-                model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(12)])
-                model.layers[11].self_attn = attn
-                model.load_weights(
-                    [
-                        ("layers.11.self_attn.kv_b_proj.weight", codes),
-                        ("layers.11.self_attn.kv_b_proj.weight_scale", scales),
-                    ]
-                )
-                local = slice(rank * 32 // world, (rank + 1) * 32 // world)
-                torch.testing.assert_close(layer.weight, codes[local])
-                layer.quant_method.process_weights_after_loading(layer)
-                sfa = rt.scope["AscendSFAImpl"]()
-                sfa.kv_b_proj, sfa.kv_lora_rank, sfa.local_num_heads = layer, 8, 4 // world
-                sfa.qk_nope_head_dim, sfa.v_head_dim = 4, 4
-                sfa.rl_weight_update_enabled, sfa.has_indexer, sfa.enable_sparse_sfa_c8 = False, False, False
-                sfa._parallel_o_proj = None
-                sfa._resolve_preprocess_type = lambda dtype: rt.scope["PreprocessType"].NATIVE
-                sfa.process_weights_after_loading(torch.bfloat16)
-                restored = (codes[local].float() * scales[local].float()).to(torch.bfloat16).reshape(4 // world, 8, 8)
-                torch.testing.assert_close(sfa.W_UK_T, restored[:, :4, :], rtol=0, atol=0)
-                torch.testing.assert_close(sfa.W_UV, restored[:, 4:, :].transpose(1, 2).contiguous(), rtol=0, atol=0)
-                self.assertTrue(layer.disposed)
-                self.assertEqual(sfa.W_UV.dtype, torch.bfloat16)
-                torch.testing.assert_close(layer.weight, codes[local].T.contiguous(), rtol=0, atol=0)
-
-    def test_kv_b_restore_blocks_and_rejects_invalid_quantization_metadata(self):
-        restore = self.rt.helper.restore_ct_kv_b
-        codes = torch.arange(-30, 30, dtype=torch.int8).reshape(5, 12)
-        scales = torch.linspace(0.01, 0.5, 12)
-        expected = (codes.float() * scales).to(torch.bfloat16)
-        for block in (1, 3, 256):
-            torch.testing.assert_close(
-                restore(codes, scales, torch.bfloat16, column_block_size=block), expected, rtol=0, atol=0
-            )
-        with self.assertRaisesRegex(ValueError, "one floating-point scale"):
-            restore(codes, scales[:6], torch.bfloat16)
-        with self.assertRaisesRegex(ValueError, "INT8"):
-            restore(codes.float(), scales, torch.bfloat16)
-
-    def test_indexer_ct_constructor_and_existing_checkpoint_keys(self):
-        rt = self.rt
-        cfg = SimpleNamespace(index_topk=4, index_n_heads=4, index_head_dim=4, qk_rope_head_dim=0, index_kpool=4)
+        quant = config(rt)
         indexer = rt.scope["Indexer"](
             SimpleNamespace(attention_config=SimpleNamespace(indexer_kv_dtype="auto")),
-            cfg,
+            SimpleNamespace(index_topk=4, index_n_heads=4, index_head_dim=4, qk_rope_head_dim=0, index_kpool=4),
             16,
             16,
-            config(rt),
+            quant,
             object(),
             torch.empty(4, 7),
             "layers.11.self_attn.indexer",
         )
         model = rt.scope["Glm5NextModel"]()
         model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
+        model.quant_config = quant
         model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(12)])
         model.layers[11].self_attn = torch.nn.Module()
         model.layers[11].self_attn.indexer = indexer
-        checkpoint = []
-        for sid, (name, n) in enumerate(
-            (("index_kpool_compress_gate", 4), ("wk", 4), ("weights_proj", 4), ("wq_b", 16))
-        ):
-            codes = ((torch.arange(n * 16).reshape(n, 16) + sid) % 255 - 127).to(torch.int8)
-            scales = ((torch.arange(n) + sid + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-            stem = "layers.11.self_attn.indexer." + name
-            checkpoint.extend([(stem + ".weight", codes), (stem + ".weight_scale", scales)])
-        loaded = model.load_weights(checkpoint)
-        self.assertIn("layers.11.self_attn.indexer.index_kpool_compress_gate.weight", loaded)
-        self.assertIn("layers.11.self_attn.indexer.wk_weights_proj.weight_scale", loaded)
-        for projection in (indexer.index_kpool_compress_gate, indexer.wk_weights_proj, indexer.wq_b):
-            self.assertEqual(projection.weight.dtype, torch.int8)
-            projection.quant_method.process_weights_after_loading(projection)
-        backend = rt.scope["Glm5NextKPoolIndexerBackend"]()
-        backend.head_dim = 4
+        return model, indexer
+
+    def test_float_kpool_gate_both_names_load_without_value_or_dtype_conversion(self):
+        stem = "layers.11.self_attn.indexer.index_kpool_compress_gate"
+        value = torch.arange(64, dtype=torch.bfloat16).reshape(4, 16) / 128
+        for alias in (stem, stem + ".weight"):
+            model, indexer = self.indexer_model()
+            self.assertIsInstance(indexer.index_kpool_compress_gate, torch.nn.Parameter)
+            self.assertEqual(model.load_weights([(alias, value)]), {stem})
+            torch.testing.assert_close(indexer.index_kpool_compress_gate, value, rtol=0, atol=0)
+            for projection in (indexer.wk_weights_proj, indexer.wq_b):
+                self.assertTrue(projection.weight.is_floating_point())
+                self.assertNotIn("weight_scale", dict(projection.named_parameters()))
+
+    def test_native_kpool_weight_preparation_uses_original_floating_matrices(self):
+        _, indexer = self.indexer_model()
+        indexer.wk_weights_proj.weight.data.copy_(torch.arange(8 * 16).reshape(8, 16) / 128)
+        indexer.index_kpool_compress_gate.data.fill_(0.25)
+        backend = self.rt.scope["Glm5NextKPoolIndexerBackend"]()
         backend.wk_weights_proj = indexer.wk_weights_proj
         backend.index_kpool_compress_gate = indexer.index_kpool_compress_gate
-        backend.k_norm = torch.nn.LayerNorm(4)
+        backend.k_norm, backend.head_dim = indexer.k_norm, 4
         backend.process_weights_after_loading()
-        x = torch.arange(3 * 16).reshape(3, 16).to(torch.bfloat16)
-        projected = rt.helper.ct_kpool_input(x, backend.wk_weights_proj, backend.index_kpool_compress_gate, 4)
-        self.assertEqual(projected.shape, x.shape)
-        torch.testing.assert_close(projected[:, :4], backend.wk_weights_proj(x)[0][:, :4])
-        torch.testing.assert_close(projected[:, 4:8], backend.index_kpool_compress_gate(x)[0])
-        torch.testing.assert_close(projected.float() @ backend._key_weight.float().T, projected[:, :4].float())
-        torch.testing.assert_close(projected.float() @ backend._gate_weight.float().T, projected[:, 4:8].float())
-        self.assertEqual(projected[:, 8:].count_nonzero(), 0)
-        before = projected[:, 4:8].clone()
-        indexer.index_kpool_compress_gate.weight_scale.data.mul_(2)
-        after = rt.helper.ct_kpool_input(x, backend.wk_weights_proj, backend.index_kpool_compress_gate, 4)
-        torch.testing.assert_close(after[:, 4:8], before * 2)
-        # Exercise the actual CANN orchestration, including retained MTP tails.
-        backend.topk_tokens, backend.index_kpool, backend.topk_indices_buffer = 4, 4, None
-        backend.index_kpool_compress_ape = torch.zeros(4, 4)
-        metadata = SimpleNamespace(
-            write_metadata=None,
-            query_metadata=None,
-            positions=torch.arange(3),
-            cum_query_lens=torch.tensor([3]),
-            query_start_loc=torch.tensor([0, 3]),
-            start_pos=torch.tensor([0]),
-            pool_tail=torch.tensor([3]),
-            pooled_slot_mapping=torch.tensor([0]),
-            keypool_state_table=torch.tensor([[1, 2]]),
-            keypool_start_offsets=torch.tensor([0]),
-        )
-        tail_metadata = SimpleNamespace(
-            block_size=4, cann_inputs=SimpleNamespace(retained_indices=torch.tensor([0, 2]))
-        )
-        recorded = {}
-        backend._prepare_keypool_state = lambda *args: torch.zeros(3, 4, 8)
-
-        def pool(hidden, key, gate, *args, **kw):
-            recorded["pool_input"] = hidden
-            return torch.zeros(1, 4, dtype=torch.bfloat16)
-
-        backend._key_pool = pool
-        backend._gather_retained_hidden = lambda hidden, indices: hidden[indices]
-
-        def write(*args, **kwargs):
-            recorded["tail_key"], recorded["tail_gate"] = args[2:4]
-
-        backend._write_keypool_caches = write
-        result = backend._forward_cann(
-            x,
-            None,
-            None,
-            torch.empty(1, 1, 1, 4, dtype=torch.bfloat16),
-            torch.empty(1, 4, 8),
-            metadata,
-            tail_metadata,
-            compute_topk=False,
-        )
-        self.assertIsNone(result)
-        torch.testing.assert_close(recorded["pool_input"], after)
-        torch.testing.assert_close(recorded["tail_gate"], after[[0, 2], 4:8].float())
+        torch.testing.assert_close(backend._key_weight, indexer.wk_weights_proj.weight[:4])
         torch.testing.assert_close(
-            recorded["tail_key"],
-            torch.nn.functional.layer_norm(
-                after[[0, 2], :4].float(), (4,), backend.k_norm.weight, backend.k_norm.bias, 1e-5
-            ),
+            backend._gate_weight, indexer.index_kpool_compress_gate.to(backend._key_weight.dtype)
         )
+        torch.testing.assert_close(backend._head_weight_f32, indexer.wk_weights_proj.weight[4:].float())
+        self.assertFalse(hasattr(backend, "_ct_projections"))
 
-    def test_vision_qkv_prefix_and_tp_scale_loading(self):
-        rt = self.rt
-        for world in (1, 2, 4):
-            rt.state.world = world
-            for rank in range(world):
-                rt.state.rank = rank
-                vision = rt.scope["Glm5NextVisionAttention"](
-                    16, 4, 16, quant_config=config(rt), prefix="visual.blocks.0.attn"
-                )
-                self.assertEqual(vision.qkv.prefix, "visual.blocks.0.attn.qkv")
-                codes = (torch.arange(48 * 16).reshape(48, 16) % 255 - 127).to(torch.int8)
-                scales = ((torch.arange(48) + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-                vision.qkv.weight.weight_loader(vision.qkv.weight, codes)
-                vision.qkv.weight_scale.weight_loader(vision.qkv.weight_scale, scales)
-                indices = torch.cat(
-                    [torch.arange(i * 16 + rank * 16 // world, i * 16 + (rank + 1) * 16 // world) for i in range(3)]
-                )
-                torch.testing.assert_close(vision.qkv.weight, codes[indices])
-                torch.testing.assert_close(vision.qkv.weight_scale, scales[indices].to(vision.qkv.weight_scale.dtype))
-                self.assertEqual(vision.proj.weight.dtype, torch.int8)
-        plain = rt.scope["Glm5NextVisionAttention"](16, 4, 16, quant_config=None, prefix="visual.blocks.0.attn")
-        self.assertEqual(plain.qkv.prefix, "visual.blocks.0.attn.qkv")
-        self.assertNotIn("weight_scale", dict(plain.qkv.named_parameters()))
+    def test_main_loader_rejects_old_non_mlp_qparams_and_integer_weights(self):
+        for suffix, value in (("weight", torch.ones(4, 16, dtype=torch.int8)), ("weight_scale", torch.ones(4, 1))):
+            model, _ = self.indexer_model()
+            with self.assertRaisesRegex(ValueError, "MLP-only.*non-MLP"):
+                model.load_weights([(f"layers.11.self_attn.indexer.wk.{suffix}", value)])
 
-    def test_mla_q_a_and_kv_a_scales_load_into_native_replicated_fusion(self):
+    def test_router_remains_native_float_and_preserves_correction_bias(self):
         rt = self.rt
-        rt.state.world = 4
-        codes = (torch.arange(24 * 16).reshape(24, 16) % 255 - 127).to(torch.int8)
-        scales = ((torch.arange(24) + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-        for rank in range(4):
-            rt.state.rank = rank
-            fused = rt.scope["DeepSeekV2FusedQkvAProjLinear"](
-                16, [16, 8], quant_config=config(rt), prefix="layers.11.self_attn.fused_qkv_a_proj"
-            )
-            model = rt.scope["Glm5NextModel"]()
-            model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
-            model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(12)])
-            model.layers[11].self_attn = torch.nn.Module()
-            model.layers[11].self_attn.fused_qkv_a_proj = fused
-            checkpoint = []
-            for name, part in [("q_a_proj", slice(0, 16)), ("kv_a_proj_with_mqa", slice(16, 24))]:
-                stem = "layers.11.self_attn." + name
-                checkpoint.extend([(stem + ".weight", codes[part]), (stem + ".weight_scale", scales[part])])
-            model.load_weights(checkpoint)
-            self.assertEqual(fused.tp_size, 1)
-            torch.testing.assert_close(fused.weight, codes)
-            torch.testing.assert_close(fused.weight_scale, scales.to(fused.weight_scale.dtype))
+        cfg = SimpleNamespace(
+            hidden_size=16,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            routed_scaling_factor=1.0,
+            hidden_act="silu",
+            topk_method="noaux_tc",
+        )
+        moe = rt.scope["Glm5NextMoE"](
+            cfg, SimpleNamespace(use_sequence_parallel_moe=False), config(rt), prefix="layers.10.mlp"
+        )
+        moe.gate.weight.data.fill_(0.25)
+        moe.gate.e_score_correction_bias.data.copy_(torch.arange(8))
+        self.assertNotIn("weight_scale", dict(moe.gate.named_parameters()))
+        x = torch.ones(2, 16, dtype=moe.gate.weight.dtype)
+        torch.testing.assert_close(moe.gate(x)[0], torch.full((2, 8), 4.0))
+        torch.testing.assert_close(moe.gate.e_score_correction_bias, torch.arange(8).float())
+
+    def test_kda_keeps_float_projections_and_restores_parent_config(self):
+        rt = self.rt
+        model_cfg = SimpleNamespace(
+            hidden_size=16,
+            hidden_act="silu",
+            rms_norm_eps=1e-5,
+            linear_head_dim=128,
+            linear_num_heads=4,
+            linear_conv_kernel_dim=4,
+            linear_lower_bound=-5 + 1e-3,
+        )
+        quant = config(rt)
+        vcfg = SimpleNamespace(
+            quant_config=quant,
+            model_config=SimpleNamespace(dtype=torch.bfloat16),
+            cache_config=object(),
+            speculative_config=None,
+        )
+        layer = rt.scope["Glm5NextLinearAttention"](model_cfg, vcfg, "layers.0.self_attn")
+        self.assertIsNone(layer.quant_config)
+        self.assertIs(vcfg.quant_config, quant)
+        self.assertTrue(layer.in_proj_qkvbfg_a.weight.is_floating_point())
+        self.assertNotIn("weight_scale", dict(layer.in_proj_qkvbfg_a.named_parameters()))
+
+    def test_float_head_uses_native_vocab_padding(self):
+        head = self.rt.scope["AscendParallelLMHead"](
+            16, 16, quant_config=config(self.rt), params_dtype=torch.bfloat16, prefix="lm_head"
+        )
+        self.assertEqual(head.weight.dtype, torch.bfloat16)
+        self.assertNotIn("weight_scale", dict(head.named_parameters()))
+        self.assertIsNone(config(self.rt).get_quant_method(head, "lm_head"))
+
+    def test_mapping_keeps_only_mlp_extension_and_preserves_parent_mapping(self):
+        inherited = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        mapping = self.rt.helper.glm5next_packed_mapping(inherited)
+        self.assertEqual(set(mapping), {"qkv_proj", "gate_up_proj"})
+        mapping["qkv_proj"].append("other")
+        self.assertEqual(len(inherited["qkv_proj"]), 3)
+
+    def test_mtp_eh_projection_retains_native_float_forward(self):
+        scope = dict(self.rt.scope)
+        path = ROOT / "vllm_ascend/models/glm5next/mtp.py"
+        owner = next(
+            n
+            for n in ast.parse(path.read_text(encoding="utf-8")).body
+            if isinstance(n, ast.ClassDef) and n.name == "Glm5NextMultiTokenPredictorLayer"
+        )
+        ctor = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        end = next(
+            i
+            for i, n in enumerate(ctor.body)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Attribute) and t.attr == "eh_proj" for t in n.targets)
+        )
+        ctor.body = ctor.body[: end + 1]
+        forward = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+        owner.body, owner.bases = [ctor, forward], [ast.Name(id="Module", ctx=ast.Load())]
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        exec(
+            compile(ast.fix_missing_locations(ast.Module(body=[future, owner], type_ignores=[])), str(path), "exec"),
+            scope,
+        )
+        draft = SimpleNamespace(hf_text_config=SimpleNamespace(hidden_size=16, rms_norm_eps=1e-5))
+        layer = scope["Glm5NextMultiTokenPredictorLayer"](
+            SimpleNamespace(quant_config=config(self.rt), speculative_config=SimpleNamespace(draft_model_config=draft)),
+            "model.layers.45",
+        )
+        self.assertIs(type(layer.eh_proj), torch.nn.Linear)
+        self.assertNotIn("weight_scale", dict(layer.eh_proj.named_parameters()))
+        layer.eh_proj = layer.eh_proj.to(torch.bfloat16)
+        layer.eh_proj.weight.data.fill_(0.25)
+        for norm in (layer.enorm, layer.hnorm):
+            norm.weight, norm.variance_epsilon = None, 1e-5
+        layer.mtp_block = lambda **kw: (kw["hidden_states"], None, None, None)
+        layer.shared_head = SimpleNamespace(norm=lambda hidden, residual: (hidden, None))
+        x = torch.ones(2, 16, dtype=torch.bfloat16)
+        with patch.object(
+            torch.ops.vllm,
+            "glm5next_mtp_eh_norm",
+            lambda pos, embeds, prev, *a: torch.cat((embeds, prev), dim=-1),
+            create=True,
+        ):
+            output = layer(torch.zeros(2, dtype=torch.long), torch.arange(2), x, inputs_embeds=x)[0]
+        torch.testing.assert_close(output, torch.full((2, 16), 8.0, dtype=torch.bfloat16))
+
+    def test_vision_native_float_constructor_has_original_qkv_name(self):
+        layer = self.rt.scope["Glm5NextVisionAttention"](16, 4, 16, quant_config=None, prefix="visual.blocks.0.attn")
+        self.assertEqual(layer.qkv.prefix, "visual.blocks.0.attn.qkv")
+        for projection in (layer.qkv, layer.proj):
+            self.assertTrue(projection.weight.is_floating_point())
+            self.assertNotIn("weight_scale", dict(projection.named_parameters()))
+
+    def test_mtp_loader_accepts_float_kpool_alias_after_language_prefix_mapping(self):
+        scope = dict(self.rt.scope)
+        scope.update(
+            get_spec_layer_idx_from_weight_name=lambda cfg, name: 45 if ".layers.45." in name else None,
+            fused_moe_make_expert_params_mapping=lambda *args, **kwargs: [],
+        )
+        execute_nodes(
+            ROOT / "vllm_ascend/models/glm5next/mtp.py",
+            scope,
+            classes={"Glm5NextMTP": ("Module", {"load_weights", "_rewrite_spec_layer_name"})},
+        )
+        mtp = scope["Glm5NextMTP"]()
+        mtp.quant_config, mtp.config = config(self.rt), SimpleNamespace(n_routed_experts=288)
+        mtp.model = torch.nn.Module()
+        mtp.model.mtp_start_layer_idx, mtp.model.num_mtp_layers = 45, 1
+        mtp.model.layers = torch.nn.ModuleDict({"45": torch.nn.Module()})
+        mtp.model.layers["45"].mtp_block = torch.nn.Module()
+        mtp.model.layers["45"].mtp_block.self_attn = torch.nn.Module()
+        _, indexer = self.indexer_model()
+        mtp.model.layers["45"].mtp_block.self_attn.indexer = indexer
+        mtp.is_rot_weight_used = False
+        mtp._maybe_set_own_lm_head = lambda names: None
+        name = "model.language_model.layers.45.self_attn.indexer.index_kpool_compress_gate.weight"
+        value = torch.full((4, 16), 0.5, dtype=torch.bfloat16)
+        loaded = mtp.load_weights([(name, value)])
+        self.assertEqual(loaded, {"model.layers.45.mtp_block.self_attn.indexer.index_kpool_compress_gate"})
+        torch.testing.assert_close(indexer.index_kpool_compress_gate, value, rtol=0, atol=0)
 
     def mhc_layer(self, quant, layer_idx=0, *, is_mtp_layer=False):
         cfg = SimpleNamespace(
@@ -791,7 +773,7 @@ class TestGlmCTLinears(unittest.TestCase):
             vcfg, cfg, layer_idx, prefix=f"layers.{layer_idx}", is_mtp_layer=is_mtp_layer
         )
 
-    def test_mhc_bare_bf16_checkpoint_loads_all_270_keys_under_broad_ct_recipe(self):
+    def test_mhc_bare_bf16_checkpoint_loads_all_270_keys_under_mlp_ct_recipe(self):
         rt = self.rt
         model = rt.scope["Glm5NextModel"]()
         model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
@@ -913,176 +895,6 @@ class TestGlmCTLinears(unittest.TestCase):
         self.assertEqual(calls[0][1].dtype, torch.float32)
         self.assertEqual(calls[0][4:], (4, 3, 1e-5, 1e-6))
 
-    def test_mtp_eh_projection_native_int8_and_tuple_forward(self):
-        rt = self.rt
-        scope = dict(rt.scope)
-        path = ROOT / "vllm_ascend/models/glm5next/mtp.py"
-        owner = next(
-            n
-            for n in ast.parse(path.read_text(encoding="utf-8")).body
-            if isinstance(n, ast.ClassDef) and n.name == "Glm5NextMultiTokenPredictorLayer"
-        )
-        ctor = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
-        end = next(i for i, n in enumerate(ctor.body) if isinstance(n, ast.If) and "self.eh_proj" in ast.unparse(n))
-        ctor.body = ctor.body[: end + 1]
-        forward = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
-        owner.body, owner.bases = [ctor, forward], [ast.Name(id="Module", ctx=ast.Load())]
-        scope["fused_eh_norm"] = lambda pos, emb, prev, *args: torch.cat((emb, prev), -1)
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(
-                        body=[
-                            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-                            owner,
-                        ],
-                        type_ignores=[],
-                    )
-                ),
-                str(path),
-                "exec",
-            ),
-            scope,
-        )
-        cfg = SimpleNamespace(hidden_size=16, rms_norm_eps=1e-5)
-        vcfg = SimpleNamespace(
-            quant_config=config(rt),
-            speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_text_config=cfg)),
-        )
-        layer = scope["Glm5NextMultiTokenPredictorLayer"](vcfg, "model.layers.45")
-        projection = layer.eh_proj
-        self.assertEqual(projection.weight.dtype, torch.int8)
-        projection.weight.weight_loader(projection.weight, torch.ones(16, 32, dtype=torch.int8))
-        projection.weight_scale.weight_loader(projection.weight_scale, torch.full((16, 1), 0.25))
-        projection.quant_method.process_weights_after_loading(projection)
-        for norm in (layer.enorm, layer.hnorm):
-            norm.weight, norm.variance_epsilon = None, 1e-5
-        layer.mtp_block = lambda **kw: (kw["hidden_states"], None, None, None)
-        layer.shared_head = SimpleNamespace(norm=lambda hidden, residual: (hidden, None))
-        x = torch.full((2, 16), 127.0, dtype=torch.bfloat16)
-        with patch.object(torch.ops.vllm, "glm5next_mtp_eh_norm", scope["fused_eh_norm"], create=True):
-            actual = layer(torch.zeros(2, dtype=torch.long), torch.arange(2), x, inputs_embeds=x)[0]
-        torch.testing.assert_close(actual, torch.full((2, 16), 1016.0, dtype=torch.bfloat16))
-
-    def test_kda_restores_projection_config_without_changing_parent_setup(self):
-        rt = self.rt
-        model_cfg = SimpleNamespace(
-            hidden_size=16,
-            hidden_act="silu",
-            rms_norm_eps=1e-5,
-            linear_head_dim=128,
-            linear_num_heads=4,
-            linear_conv_kernel_dim=4,
-            linear_lower_bound=-5 + 1e-3,
-        )
-        quant = config(rt)
-        vcfg = SimpleNamespace(
-            quant_config=quant,
-            model_config=SimpleNamespace(dtype=torch.bfloat16),
-            cache_config=object(),
-            speculative_config=None,
-        )
-        layer = rt.scope["Glm5NextLinearAttention"](model_cfg, vcfg, "layers.0.self_attn")
-        self.assertIs(layer.quant_config, quant)
-        self.assertIs(vcfg.quant_config, quant)
-        self.assertEqual(layer.in_proj_qkvbfg_a.weight.dtype, torch.int8)
-        self.assertIn("weight_scale", dict(layer.in_proj_qkvbfg_a.named_parameters()))
-        self.assertEqual(layer.in_proj_qkvbfg_a.weight_scale.shape, (4 * 128 * 3 + 4 + 128 * 2, 1))
-
-    def test_router_loads_existing_int8_scales_and_preserves_correction_bias(self):
-        rt = self.rt
-        cfg = SimpleNamespace(
-            hidden_size=16,
-            n_routed_experts=8,
-            n_shared_experts=1,
-            routed_scaling_factor=1.0,
-            hidden_act="silu",
-            topk_method="noaux_tc",
-        )
-        weights = (torch.arange(8 * 16).reshape(8, 16) % 255 - 127).to(torch.int8)
-        scales = ((torch.arange(8) + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-        correction = torch.linspace(-1, 1, 8)
-        x = torch.tensor([list(range(-7, 8)) + [127]], dtype=torch.bfloat16)
-        for world in (1, 2, 4):
-            rt.state.world = world
-            for rank in range(world):
-                rt.state.rank = rank
-                moe = rt.scope["Glm5NextMoE"](
-                    cfg, SimpleNamespace(use_sequence_parallel_moe=False), config(rt), prefix="layers.10.mlp"
-                )
-                model = rt.scope["Glm5NextModel"]()
-                model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
-                model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(11)])
-                model.layers[10].mlp = moe
-                loaded = model.load_weights(
-                    [
-                        ("layers.10.mlp.gate.weight", weights),
-                        ("layers.10.mlp.gate.weight_scale", scales),
-                        ("layers.10.mlp.gate.e_score_correction_bias", correction),
-                    ]
-                )
-                self.assertIn("layers.10.mlp.gate.weight_scale", loaded)
-                self.assertEqual(moe.gate.weight.dtype, torch.int8)
-                torch.testing.assert_close(moe.gate.weight, weights, rtol=0, atol=0)
-                torch.testing.assert_close(
-                    moe.gate.weight_scale, scales.to(moe.gate.weight_scale.dtype), rtol=0, atol=0
-                )
-                torch.testing.assert_close(moe.gate.e_score_correction_bias, correction, rtol=0, atol=0)
-                moe.gate.quant_method.process_weights_after_loading(moe.gate)
-                actual, bias = moe.gate(x)
-                expected = (
-                    ((x.to(torch.int32) @ weights.T.to(torch.int32)).float() * scales.T.float()).to(x.dtype).float()
-                )
-                self.assertEqual(actual.dtype, torch.float32)
-                self.assertIsNone(bias)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                # The internal MoE runner must also use GateLinear.forward.
-                runner = rt.scope["AscendMoERunner"]()
-                runner.gate = moe.gate
-                torch.testing.assert_close(runner._apply_router_linear(x), expected, rtol=0, atol=0)
-                moe.gate.weight_scale.data.mul_(2)
-                torch.testing.assert_close(moe.gate(x)[0], expected * 2, rtol=0, atol=0)
-                torch.testing.assert_close(moe.gate.e_score_correction_bias, correction, rtol=0, atol=0)
-
-    def test_router_bf16_policy_matches_module_name_and_keeps_legacy_forward(self):
-        rt = self.rt
-        for quant in (None, config(rt, [r"re:.*\.mlp\.gate$"])):
-            gate = rt.scope["AscendGateLinear"](
-                16, 8, params_dtype=torch.float32, quant_config=quant, prefix="layers.10.mlp.gate"
-            )
-            self.assertNotIn("weight_scale", dict(gate.named_parameters()))
-            gate.weight.data.fill_(0.25)
-            x = torch.ones((2, 16), dtype=torch.bfloat16)
-            torch.testing.assert_close(gate(x)[0], torch.full((2, 8), 4.0))
-        # Ignore/targets match the module stem, not the full tensor key.
-        self.assertIsNotNone(
-            config(rt, [r"re:.*mlp\.gate\..*$"])
-            .get_quant_method(gate, "layers.10.mlp.gate")
-            .__dict__.get("quant_method")
-        )
-
-    def test_quantized_router_honors_main_tensor_and_tuple_return_contract(self):
-        rt = self.rt
-        rt.state.rank, rt.state.world = 0, 1
-        for return_bias in (False, True):
-            gate = rt.scope["AscendGateLinear"](
-                16,
-                4,
-                quant_config=config(rt),
-                return_bias=return_bias,
-                prefix="layers.3.mlp.gate",
-            )
-            gate.weight.weight_loader(gate.weight, torch.ones((4, 16), dtype=torch.int8))
-            gate.weight_scale.weight_loader(gate.weight_scale, torch.full((4, 1), 0.25))
-            gate.quant_method.process_weights_after_loading(gate)
-            output = gate(torch.full((2, 16), 127.0, dtype=torch.bfloat16))
-            self.assertEqual(isinstance(output, tuple), return_bias)
-            if return_bias:
-                output, bias = output
-                self.assertIsNone(bias)
-            self.assertEqual(output.dtype, torch.float32)
-            torch.testing.assert_close(output, torch.full((2, 4), 508.0))
-
     def test_release_mxfp4_mxfp8_detection_is_preserved(self):
         quant = config(self.rt)
         for bits, storage, expected in (
@@ -1097,217 +909,50 @@ class TestGlmCTLinears(unittest.TestCase):
             )
             self.assertEqual(quant._detect_quant_type(weight, activation, storage), expected)
 
-    def test_ct_kpool_head_projection_preserves_release_full_batch(self):
-        path = ROOT / "vllm_ascend/attention/indexer_kpool.py"
-        owner = next(
-            n
-            for n in ast.parse(path.read_text(encoding="utf-8")).body
-            if isinstance(n, ast.ClassDef) and n.name == "Glm5NextKPoolIndexerBackend"
-        )
-        forward = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
-        projection = next(
-            n
-            for n in forward.body
-            if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "compute_topk"
-        )
-        hidden = torch.arange(96, dtype=torch.float32).reshape(6, 16)
-        calls = []
-
-        def project(x):
-            calls.append(x.clone())
-            return (x[:, :8], None)
-
-        backend = SimpleNamespace(
-            _ct_projections=True,
-            n_head=4,
-            head_dim=4,
-            softmax_scale=2.0,
-            wq_b=lambda x: (x, None),
-            wk_weights_proj=project,
-        )
-        for shard in (None, SimpleNamespace(start=2, stop=5)):
-            scope = dict(
-                torch=torch,
-                self=backend,
-                q_c=hidden,
-                hidden=hidden,
-                num_tokens=6,
-                compute_topk=True,
-                indexer_metadata=SimpleNamespace(indexer_row_shard=shard),
-            )
-            exec(compile(ast.Module(body=[projection], type_ignores=[]), str(path), "exec"), scope)
-            # The 0.32 release does not shard query rows. Extra metadata from
-            # a newer caller must not change this release's projection shape.
-            selected = hidden
-            torch.testing.assert_close(calls[-1], selected)
-            torch.testing.assert_close(scope["q_values"], selected.view(-1, 4, 4))
-            torch.testing.assert_close(scope["weights"], selected[:, 4:8])
-
-    def test_shared_expert_gate_up_and_down_scales_use_native_tp_loaders(self):
-        rt = self.rt
-        for world in (1, 2, 4):
-            rt.state.world = world
-            for rank in range(world):
-                rt.state.rank = rank
-                shared = rt.scope["Glm5NextMLP"](
-                    16, 32, "silu", quant_config=config(rt), reduce_results=False, prefix="layers.10.mlp.shared_experts"
-                )
-                model = rt.scope["Glm5NextModel"]()
-                model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
-                model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(11)])
-                model.layers[10].mlp = torch.nn.Module()
-                model.layers[10].mlp.shared_experts = shared
-                checkpoint, expected_w, expected_s = [], [], []
-                for sid, name in enumerate(("gate_proj", "up_proj", "down_proj")):
-                    n, k = (16, 32) if sid == 2 else (32, 16)
-                    w = ((torch.arange(n * k).reshape(n, k) + sid) % 255 - 127).to(torch.int8)
-                    s = ((torch.arange(n) + sid + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-                    stem = f"layers.10.mlp.shared_experts.{name}"
-                    checkpoint.extend([(stem + ".weight", w), (stem + ".weight_scale", s)])
-                    expected_w.append(
-                        w[:, rank * k // world : (rank + 1) * k // world]
-                        if sid == 2
-                        else w[rank * n // world : (rank + 1) * n // world]
+    def test_dense_and_shared_gate_up_down_scales_use_native_tp_loaders(self):
+        for is_shared in (False, True):
+            prefix = "layers.10.mlp.shared_experts" if is_shared else "layers.10.mlp"
+            rt = self.rt
+            for world in (1, 2, 4):
+                rt.state.world = world
+                for rank in range(world):
+                    rt.state.rank = rank
+                    shared = rt.scope["Glm5NextMLP"](
+                        16, 32, "silu", quant_config=config(rt), reduce_results=False, prefix=prefix
                     )
-                    expected_s.append(s if sid == 2 else s[rank * n // world : (rank + 1) * n // world])
-                loaded = model.load_weights(checkpoint)
-                self.assertIn("layers.10.mlp.shared_experts.gate_up_proj.weight_scale", loaded)
-                for layer, w, s in (
-                    (shared.gate_up_proj, torch.cat(expected_w[:2]), torch.cat(expected_s[:2])),
-                    (shared.down_proj, expected_w[2], expected_s[2]),
-                ):
-                    torch.testing.assert_close(layer.weight, w, rtol=0, atol=0)
-                    torch.testing.assert_close(layer.weight_scale, s.to(layer.weight_scale.dtype), rtol=0, atol=0)
-                    layer.quant_method.process_weights_after_loading(layer)
-                    x = torch.ones((1, w.shape[1]), dtype=torch.bfloat16)
-                    x[0, -1] = 127
-                    expected = ((x.to(torch.int32) @ w.T.to(torch.int32)).float() * s.T.float()).to(x.dtype)
-                    torch.testing.assert_close(layer.quant_method.apply(layer, x), expected, rtol=0, atol=0)
-
-    def test_model_free_matching_preserves_bare_correction_bias(self):
-        # Execute compressed-tensors' actual matching contract without its
-        # heavyweight package imports. Only *.weight is targeted by default.
-        scope = dict(re=re)
-        execute_nodes(
-            ROOT.parent / "compressed-tensors/src/compressed_tensors/utils/match.py",
-            scope,
-            functions=("match_name", "match_quantizable_tensors"),
-        )
-        tensors = {"layers.10.mlp.gate.weight": object(), "layers.10.mlp.gate.e_score_correction_bias": object()}
-        self.assertEqual(
-            list(scope["match_quantizable_tensors"](tensors, [], [r"re:^(?!.*\.experts\.\d+\.).*$"])),
-            [("layers.10.mlp.gate", "layers.10.mlp.gate.weight")],
-        )
-
-    def test_fused_weight_scale_tp_and_glm_loader(self):
-        rt = self.rt
-        for world in (1, 2, 4):
-            rt.state.world = world
-            for rank in range(world):
-                rt.state.rank = rank
-                fused = rt.scope["_Glm5NextMergedColumnParallelLinear"](
-                    16,
-                    [16, 16, 16, 4, 8, 8],
-                    (4, 5),
-                    world,
-                    bias=False,
-                    quant_config=config(rt),
-                    params_dtype=torch.bfloat16,
-                    prefix="layers.0.self_attn.in_proj_qkvbfg_a",
-                )
-                model = rt.scope["Glm5NextModel"]()
-                model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
-                attn = torch.nn.Module()
-                attn.in_proj_qkvbfg_a = fused
-                layer = torch.nn.Module()
-                layer.self_attn = attn
-                model.layers = torch.nn.ModuleList([layer])
-                weights, expected_w, expected_s = [], [], []
-                for sid, (name, n) in enumerate(
-                    zip(rt.helper.glm5next_packed_mapping()["in_proj_qkvbfg_a"], [16, 16, 16, 4, 8, 8])
-                ):
-                    w = ((torch.arange(n * 16).reshape(n, 16) + sid) % 255 - 127).to(torch.int8)
-                    s = ((torch.arange(n) + sid + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-                    weights.extend(
-                        [(f"layers.0.self_attn.{name}.weight", w), (f"layers.0.self_attn.{name}.weight_scale", s)]
-                    )
-                    part = slice(None) if sid in (4, 5) else slice(rank * n // world, (rank + 1) * n // world)
-                    expected_w.append(w[part])
-                    expected_s.append(s[part])
-                loaded = model.load_weights(weights)
-                self.assertIn("layers.0.self_attn.in_proj_qkvbfg_a.weight_scale", loaded)
-                self.assertTrue(torch.equal(fused.weight, torch.cat(expected_w)))
-                self.assertTrue(torch.equal(fused.weight_scale, torch.cat(expected_s)))
-                self.assertEqual(fused.tp_rank, rank)
-                x = torch.tensor([list(range(-7, 8)) + [127]], dtype=torch.bfloat16)
-                fused.quant_method.process_weights_after_loading(fused)
-                output = fused.quant_method.apply(fused, x)
-                expected = torch.cat(
-                    [
-                        (x.to(torch.int32) @ w.T.to(torch.int32)).float() * s.T.float()
-                        for w, s in zip(expected_w, expected_s)
-                    ],
-                    -1,
-                ).to(x.dtype)
-                torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
-    def test_lm_head_parameters_vocab_padding_and_scale_execution(self):
-        rt = self.rt
-        rt.state.world = 4
-        weight = ((torch.arange(10 * 16).reshape(10, 16) % 255) - 127).to(torch.int8)
-        scale = ((torch.arange(10) + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
-        for rank in range(4):
-            rt.state.rank = rank
-            head = rt.scope["AscendParallelLMHead"](
-                10, 16, padding_size=16, quant_config=config(rt), params_dtype=torch.bfloat16, prefix="lm_head"
-            )
-            self.assertEqual(head.weight.dtype, torch.int8)
-            self.assertIn("weight_scale", dict(head.named_parameters()))
-            head.weight.weight_loader(head.weight, weight)
-            head.weight_scale.weight_loader(head.weight_scale, scale)
-            rows = max(0, min(4, 10 - rank * 4))
-            self.assertTrue(torch.equal(head.weight_scale[:rows], scale[rank * 4 : rank * 4 + rows]))
-            self.assertEqual(head.weight_scale[rows:].count_nonzero(), 0)
-            head.quant_method.process_weights_after_loading(head)
-            x = torch.tensor([list(range(-7, 8)) + [127]], dtype=torch.bfloat16)
-            actual = head.quant_method.apply(head, x)
-            expected = torch.zeros((1, 4), dtype=x.dtype)
-            if rows:
-                expected[:, :rows] = (
-                    (x.to(torch.int32) @ weight[rank * 4 : rank * 4 + rows].T.to(torch.int32)).float()
-                    * scale[rank * 4 : rank * 4 + rows].T.float()
-                ).to(x.dtype)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            head.weight_scale.data *= 2
-            torch.testing.assert_close(head.quant_method.apply(head, x), actual * 2, rtol=0, atol=0)
-
-    def test_ignored_head_and_partial_fused_ignore(self):
-        rt = self.rt
-        head = rt.scope["AscendParallelLMHead"](
-            16, 16, quant_config=config(rt, ["lm_head"]), params_dtype=torch.bfloat16, prefix="lm_head"
-        )
-        self.assertEqual(head.weight.dtype, torch.bfloat16)
-        self.assertNotIn("weight_scale", dict(head.named_parameters()))
-        with self.assertRaisesRegex(ValueError, "different quantization schemes"):
-            rt.scope["_Glm5NextMergedColumnParallelLinear"](
-                16,
-                [16, 16, 16, 4, 8, 8],
-                (4, 5),
-                1,
-                bias=False,
-                quant_config=config(rt, [r"re:.*\.q_proj$"]),
-                prefix="layers.0.self_attn.in_proj_qkvbfg_a",
-            )
-
-    def test_mapping_is_fresh_and_legacy_profile_is_unchanged(self):
-        inherited = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
-        first = self.rt.helper.glm5next_packed_mapping(inherited)
-        first["qkv_proj"].append("other")
-        self.assertEqual(len(inherited["qkv_proj"]), 3)
-        self.assertFalse(self.rt.helper.is_glm_ct_int8_config(None))
-        legacy = config(self.rt)
-        next(iter(legacy.target_scheme_map.values()))["weights"].type = "float"
-        self.assertFalse(self.rt.helper.is_glm_ct_int8_config(legacy))
+                    model = rt.scope["Glm5NextModel"]()
+                    model.config = SimpleNamespace(n_routed_experts=None, layer_types=None)
+                    model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(11)])
+                    model.quant_config = config(rt)
+                    model.layers[10].mlp = torch.nn.Module() if is_shared else shared
+                    if is_shared:
+                        model.layers[10].mlp.shared_experts = shared
+                    checkpoint, expected_w, expected_s = [], [], []
+                    for sid, name in enumerate(("gate_proj", "up_proj", "down_proj")):
+                        n, k = (16, 32) if sid == 2 else (32, 16)
+                        w = ((torch.arange(n * k).reshape(n, k) + sid) % 255 - 127).to(torch.int8)
+                        s = ((torch.arange(n) + sid + 1) / 1024).to(torch.bfloat16).unsqueeze(1)
+                        stem = f"{prefix}.{name}"
+                        checkpoint.extend([(stem + ".weight", w), (stem + ".weight_scale", s)])
+                        expected_w.append(
+                            w[:, rank * k // world : (rank + 1) * k // world]
+                            if sid == 2
+                            else w[rank * n // world : (rank + 1) * n // world]
+                        )
+                        expected_s.append(s if sid == 2 else s[rank * n // world : (rank + 1) * n // world])
+                    loaded = model.load_weights(checkpoint)
+                    self.assertIn(f"{prefix}.gate_up_proj.weight_scale", loaded)
+                    for layer, w, s in (
+                        (shared.gate_up_proj, torch.cat(expected_w[:2]), torch.cat(expected_s[:2])),
+                        (shared.down_proj, expected_w[2], expected_s[2]),
+                    ):
+                        torch.testing.assert_close(layer.weight, w, rtol=0, atol=0)
+                        torch.testing.assert_close(layer.weight_scale, s.to(layer.weight_scale.dtype), rtol=0, atol=0)
+                        layer.quant_method.process_weights_after_loading(layer)
+                        x = torch.ones((1, w.shape[1]), dtype=torch.bfloat16)
+                        x[0, -1] = 127
+                        expected = ((x.to(torch.int32) @ w.T.to(torch.int32)).float() * s.T.float()).to(x.dtype)
+                        torch.testing.assert_close(layer.quant_method.apply(layer, x), expected, rtol=0, atol=0)
 
     def test_w4a8_unfused_gmm_preserves_channel_scales_and_assist(self):
         scope = dict(torch=torch, COMPRESSED_TENSORS_METHOD="compressed-tensors", dispose_tensor=lambda t: None)

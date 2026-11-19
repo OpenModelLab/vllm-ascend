@@ -1,15 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM CT INT4/INT8 projection configuration; no checkpoint rewriting."""
+"""GLM MLP-only CT metadata and floating checkpoint name compatibility."""
 
-import torch
+import re
+
+_MLP_PROJECTION = re.compile(r"(?:.*\.)?mlp\.(?:(?:experts\.\d+|shared_experts)\.)?(?:gate|up|down|gate_up)_proj")
+_QUANTIZED_SUFFIXES = frozenset(
+    {
+        "weight_packed",
+        "weight_shape",
+        "weight_scale",
+        "weight_scale_inv",
+        "weight_zero_point",
+        "weight_offset",
+        "input_scale",
+        "input_zero_point",
+        "output_scale",
+        "output_zero_point",
+        "scale_bias",
+    }
+)
 
 
-def is_glm_ct_int8_config(config) -> bool:
-    """Enable INT8 projections without changing legacy BF16/FP8 checkpoints.
-
-    The supported mixed profile uses per-channel symmetric INT4/INT8 weights
-    and dynamic per-token INT8 inputs. Convolutions/recurrent state are separate.
-    """
+def is_glm_ct_int_config(config) -> bool:
+    """Select loader validation only; never enable non-MLP quantization."""
     if config is None or config.get_name() != "compressed-tensors":
         return False
     schemes = list(getattr(config, "target_scheme_map", {}).values())
@@ -39,54 +52,35 @@ def is_glm_ct_int8_config(config) -> bool:
 def glm5next_packed_mapping(inherited=None) -> dict[str, list[str]]:
     """Return fresh mappings, preserving inherited vision projections."""
     mapping = {name: list(parts) for name, parts in (inherited or {}).items()}
-    mapping.update(
-        gate_up_proj=["gate_proj", "up_proj"],
-        fused_qkv_a_proj=["q_a_proj", "kv_a_proj_with_mqa"],
-        wk_weights_proj=["wk", "weights_proj"],
-        in_proj_qkvbfg_a=["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
-    )
+    mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
     return mapping
 
 
-def ct_kpool_selectors(head_dim, hidden_dim, *, device, dtype):
-    """Keep CANN's original H, selecting preprojected [K, G, zero padding]."""
-    if hidden_dim < 2 * head_dim:
-        raise ValueError("CT KPool requires hidden_dim >= 2 * head_dim")
-    key = torch.zeros((head_dim, hidden_dim), device=device, dtype=dtype)
-    gate = torch.zeros_like(key)
-    eye = torch.eye(head_dim, device=device, dtype=dtype)
-    key[:, :head_dim] = eye
-    gate[:, head_dim : 2 * head_dim] = eye
-    return key, gate
+def prepare_glm_mlp_weights(weights):
+    """Stream MLP-only CT weights, accepting both floating KPool gate names.
 
-
-def ct_kpool_input(hidden, wk_weights_proj, compress_gate, head_dim):
-    """Consume original W8/A8 methods before CANN pooling and cache updates."""
-    key = wk_weights_proj(hidden)[0][..., :head_dim]
-    gate = compress_gate(hidden)[0]
-    if key.shape != gate.shape or hidden.shape[-1] < 2 * head_dim:
-        raise ValueError("CT KPool projection shapes do not match")
-    projected = hidden.new_zeros(hidden.shape)
-    projected[..., :head_dim] = key
-    projected[..., head_dim : 2 * head_dim] = gate
-    return projected
-
-
-def restore_ct_kv_b(weight_kn, scale_n, act_dtype, *, column_block_size=256):
-    """Restore an explicitly opted-in absorbed KV projection, not W8 GEMM.
-
-    Native CT post-loading has already transposed/sharded the integer matrix.
-    Keep the original scales and bound FP32 temporary storage to a column block.
+    Integer non-MLP weights or their qparams belong to the old broad recipe.
+    Reject them rather than loading integer codes into floating projections.
+    Tensor values and optional per-weight loader kwargs pass through unchanged.
     """
-    if weight_kn.dtype != torch.int8 or weight_kn.ndim != 2:
-        raise ValueError("CT absorbed KV-b requires INT8 [K,N] after native post-loading")
-    if scale_n.ndim != 1 or scale_n.numel() != weight_kn.shape[1] or not scale_n.is_floating_point():
-        raise ValueError("CT absorbed KV-b requires one floating-point scale per output channel")
-    if act_dtype not in (torch.bfloat16, torch.float16) or column_block_size <= 0:
-        raise ValueError("CT absorbed KV-b requires BF16/FP16 output and a positive column block")
-    output = torch.empty_like(weight_kn, dtype=act_dtype)
-    for start in range(0, weight_kn.shape[1], column_block_size):
-        end = min(start + column_block_size, weight_kn.shape[1])
-        restored = weight_kn[:, start:end].float() * scale_n[start:end].float()
-        output[:, start:end].copy_(restored.to(act_dtype))
-    return output
+    seen_gates = set()
+    for entry in weights:
+        name, tensor = entry[:2]
+        extra = entry[2:]
+        if name.endswith(".index_kpool_compress_gate.weight"):
+            name = name.removesuffix(".weight")
+        if name.endswith(".index_kpool_compress_gate"):
+            if not tensor.is_floating_point():
+                raise ValueError(f"MLP-only CT requires a floating KPool gate: {name} ({tensor.dtype})")
+            if name in seen_gates:
+                raise ValueError(f"Duplicate KPool gate checkpoint aliases: {name}")
+            seen_gates.add(name)
+        stem, _, suffix = name.rpartition(".")
+        is_mlp = _MLP_PROJECTION.fullmatch(stem) is not None
+        if not is_mlp and (suffix in _QUANTIZED_SUFFIXES or (suffix == "weight" and not tensor.is_floating_point())):
+            raise ValueError(
+                f"GLM CT now supports MLP-only INT quantization; non-MLP quantized tensor {name!r} "
+                "belongs to a broad-scope checkpoint. Use the MLP-only checkpoint regenerated from BF16, "
+                "or the earlier broad-scope serving revision."
+            )
+        yield (name, tensor, *extra)

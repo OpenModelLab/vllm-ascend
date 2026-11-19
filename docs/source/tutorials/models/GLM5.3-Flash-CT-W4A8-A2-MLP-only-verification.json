@@ -1,0 +1,122 @@
+{
+  "date": "2026-11-19",
+  "parent_commit": "b950109b0818530037e936846c05a9d92f98a51c",
+  "native_restore_base": "2dd5b2b2d2e22995821efeee8b0b265fcba5b612",
+  "paired_vllm": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+  "git_history_policy": "Append one signed-off child commit; no reset, rebase, amend or force push.",
+  "scope": "MLP-only CT: routed W4A8; dense/shared W8A8; non-MLP floating; cache quantization remains a serving choice.",
+  "native_files_restored_exactly": [
+    "vllm_ascend/attention/indexer_kpool.py",
+    "vllm_ascend/attention/sfa_v1.py",
+    "vllm_ascend/models/glm5next/attention.py",
+    "vllm_ascend/models/glm5next/multimodal.py",
+    "vllm_ascend/ops/fused_moe/gate_linear.py"
+  ],
+  "preserved_files_unchanged": [
+    "vllm_ascend/quantization/methods/w4a8/w4a8.py",
+    "vllm_ascend/quantization/compressed_tensors_w4a8.py",
+    "vllm_ascend/quantization/compressed_tensors_w4a8_a5.py",
+    "vllm_ascend/models/glm5next/ops/causal_conv1d.py",
+    "vllm_ascend/patch/worker/patch_triton.py",
+    "vllm_ascend/worker/startup.py",
+    "vllm_ascend/worker/v2/model_runner.py",
+    "vllm_ascend/worker/worker.py"
+  ],
+  "cpu_checks": {
+    "mlp_native_cpu": {
+      "command": [
+        "tests/ut/quantization/test_glm5next_ct_linears.py",
+        "--vllm-root",
+        "C:\\Users\\w30015592\\AppData\\Local\\Temp\\a2-vllm032-source"
+      ],
+      "exit_code": 0,
+      "items_passed": 20,
+      "seconds": 28.91,
+      "sha256": "f614a25c36e1b8e3e32c3297f67f4008cab606a491d21f030713329192fa55a9"
+    },
+    "packed_and_memory_cpu": {
+      "command": [
+        "-m",
+        "pytest",
+        "--noconftest",
+        "-q",
+        "tests/ut/quantization/test_compressed_tensors_packed.py",
+        "tests/ut/quantization/test_w4a8_loading_memory.py"
+      ],
+      "exit_code": 0,
+      "items_passed": 63,
+      "seconds": 53.228,
+      "sha256": "78c08264828907ebe1c6720282384a8b0d0dface0af97d3b5464a904f76c8bd8"
+    },
+    "native_tp_ep_cpu": {
+      "command": [
+        "tests/ut/quantization/test_ct_native_loader_source.py",
+        "--vllm-root",
+        "C:\\Users\\w30015592\\AppData\\Local\\Temp\\a2-vllm032-source"
+      ],
+      "exit_code": 0,
+      "items_passed": 2,
+      "seconds": 44.616,
+      "sha256": "c8d578f90a204c4cbe34de4aeee2eb6d017681d5d25d002a1ba7b9d6ec512689"
+    },
+    "graph_startup_cpu": {
+      "command": [
+        "tests/ut/worker/test_glm5next_graph_startup_cpu.py"
+      ],
+      "exit_code": 0,
+      "items_passed": 11,
+      "seconds": 18.689,
+      "sha256": "13a07aaa254689db494e65c13500c9815eddc26eda8f7048975c965ba8cfb110"
+    },
+    "a5_cpu_contract_preserved": {
+      "command": [
+        "tests/ut/quantization/test_w4a8_a5_kcg.py"
+      ],
+      "exit_code": 0,
+      "items_passed": 16,
+      "seconds": 20.082,
+      "sha256": "24b12ba9778302cd54a8c8208c3d77e5e45a5a12fd764e90406068de2f5559bd"
+    }
+  },
+  "python_files_compiled": 15,
+  "ruff_0_14_0": "passed",
+  "shell_blocks_syntax_passed": 18,
+  "format_sh_ci": "❓❓pre-commit is not installed, please run:\n# Install lint deps\npip install -r requirements-lint.txt\n# (optional) Enable git commit pre check\npre-commit install\n\nSee step by step contribution guide:\nhttps://docs.vllm.ai/projects/ascend/en/latest/developer_guide/contribution",
+  "npu_validation": {
+    "real_checkpoint": "not_run_no_NPU_in_local_environment",
+    "dummy_model": "not_run_no_NPU_in_local_environment",
+    "W4A8_kernel": "not_run_no_NPU_in_local_environment",
+    "W8A8_kernel": "not_run_no_NPU_in_local_environment",
+    "C8": "not_run_no_NPU_in_local_environment",
+    "TP4_EP": "not_run_no_NPU_in_local_environment",
+    "MTP": "not_run_no_NPU_in_local_environment",
+    "vision": "not_run_no_NPU_in_local_environment",
+    "ACLGraph": "not_run_no_NPU_in_local_environment",
+    "flashcomm1": "not_run_no_NPU_in_local_environment",
+    "GPQA": "not_run_no_NPU_in_local_environment",
+    "capacity_128k_bs16": "not_run_no_NPU_in_local_environment"
+  },
+  "checkpoint_compatibility": "Accept bare and Linear-style floating KPool names without modifying model files. Reject non-MLP INT weights/qparams from old broad checkpoints.",
+  "files_sha256": {
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2-Graph.md": "919cdef48d7f7a0a6767a06507ee754fd0413b2d60d00d5f8eda28c5c678a850",
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2-MLP-only.md": "65889cfc74b90a6d37a0bb5f39a579e6735baca46915e941704e2f04c8364dd1",
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2.md": "5e5b1c80eb250982ff780ec24f2ebef45e353419793e0283298ccbf46776eca6",
+    "docs/source/tutorials/models/index.md": "c1ff765c950a94248deecc20be8394aa658cd2020938885aca1417089277c833",
+    "tests/e2e/pull_request/one_card/test_glm5next_ct_linears.py": "87bce722335e43848dd72387395d71b454a424dd5ef131d647021955569ac050",
+    "tests/e2e/pull_request/one_card/test_glm5next_ct_special_projections.py": "b14a055ee8a2def768a5494fca3484ceaa6dceb0c7760499721614e231199804",
+    "tests/ut/quantization/test_compressed_tensors_packed.py": "b2b9fe2ae513a6cdfdd81aa8104335ff4d3db567eaf1563e615dd3d76dc2aa77",
+    "tests/ut/quantization/test_glm5next_ct_linears.py": "c192b5403b26a5a95395cd7db1f107f856a88d89e6dd552cb38fff7c5aeca3b5",
+    "vllm_ascend/attention/indexer_kpool.py": "2b6593ff61e3461975e8fe69db7444c9c6b3aac5a2cc95adfee6d776cbe1978b",
+    "vllm_ascend/attention/sfa_v1.py": "3a6c7496cfb69247a3c1b0fe6d708abf1211d8f9f6d8e6e53c9d74f70675e582",
+    "vllm_ascend/models/glm5next/attention.py": "9c8dde2c134b40d1070976a37169c3fff874c76e061f69ad8fb34073868c0d16",
+    "vllm_ascend/models/glm5next/kda.py": "f6047f33e41fd16bdf4b2da74aa03b58669a6a90e873fa823cf3c9918e747535",
+    "vllm_ascend/models/glm5next/model.py": "f66a3980a513fb8bcf80fe5230b824e9c88b6505b151a07f470d566c4a76fdc6",
+    "vllm_ascend/models/glm5next/mtp.py": "a738e8bfb9023d9c3a0cb7e3dab4978e2a4792657ff3f0d1ffa3275d5df9e4d1",
+    "vllm_ascend/models/glm5next/multimodal.py": "808f5a3c2c2c109bccf7f90cf8b40f9bc32a1af4cdab9b7f0c5d77d91965ebf6",
+    "vllm_ascend/ops/fused_moe/gate_linear.py": "c9887a63095f51e196935c08050c29bbaefd15ae54f253b85fd9d9acb9b1bf12",
+    "vllm_ascend/quantization/compressed_tensors_packed.py": "8c33d9130057c421a018d49a03b9814e237616fab453bcc0b00fb92ffe9e1fdf",
+    "vllm_ascend/quantization/configs/compressed_tensors_config.py": "6c12bbc626e502984e96808de3ad4630c10b015dd0619a0c2288e70f3f22e694",
+    "vllm_ascend/quantization/glm5next.py": "a453cf11332ed32e174581247f6bb43987ea5596d0cdc6d1d17d4065704eeb04"
+  },
+  "markdownlint_0_45_0": "passed"
+}

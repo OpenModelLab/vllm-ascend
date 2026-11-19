@@ -8,6 +8,7 @@ import torch
 from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
 
 from .compressed_tensors_w4a8 import pack_output_int4
+from .glm5next import is_glm_ct_int_config, prepare_glm_mlp_weights
 
 _INT4_BITS = 4
 _INT4_PACK_FACTOR = 32 // _INT4_BITS
@@ -90,6 +91,8 @@ def prepare_glm_packed_weights(model, weights):
         for module in model.modules()
         if getattr(getattr(module, "scheme", None), "is_ct_packed", False)
     }
+    if layouts or is_glm_ct_int_config(getattr(model, "quant_config", None)):
+        weights = prepare_glm_mlp_weights(weights)
     if not layouts:
         return weights
     if len(layouts) != 1:

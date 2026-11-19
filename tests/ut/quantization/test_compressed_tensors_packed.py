@@ -23,6 +23,102 @@ with patch.dict(sys.modules, {_package.__name__: _package}):
     _spec.loader.exec_module(_module)
 unpack_packed_moe_weights = _module.unpack_packed_moe_weights
 install_packed_moe_loader = _module.install_packed_moe_loader
+prepare_glm_mlp_weights = _module.prepare_glm_mlp_weights
+
+
+@pytest.mark.parametrize("projection", ["q_a_proj", "kv_b_proj", "indexer.wk", "indexer.index_kpool_compress_gate"])
+@pytest.mark.parametrize("suffix", ["weight", "weight_scale", "weight_packed", "weight_shape"])
+def test_mlp_only_rejects_non_mlp_integer_weights_and_qparams(projection, suffix):
+    value = torch.ones((4, 4), dtype=torch.int8) if suffix == "weight" else torch.ones(4)
+    with pytest.raises(ValueError, match="MLP-only|floating KPool"):
+        list(prepare_glm_mlp_weights([(f"layers.11.self_attn.{projection}.{suffix}", value)]))
+
+
+@pytest.mark.parametrize("module_name", ["mlp.gate", "lm_head", "visual.blocks.0.attn.qkv", "model.layers.45.eh_proj"])
+def test_mlp_only_rejects_old_router_head_vision_and_mtp_quantization(module_name):
+    with pytest.raises(ValueError, match="MLP-only"):
+        list(prepare_glm_mlp_weights([(module_name + ".weight_scale", torch.ones(4))]))
+
+
+@pytest.mark.parametrize("mlp", ["mlp", "mlp.shared_experts", "mlp.experts.287"])
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_mlp_tensor_values_and_loader_kwargs_pass_through(mlp, projection):
+    tensor = torch.arange(16, dtype=torch.int8).reshape(4, 4)
+    kwargs = {"sentinel": object()}
+    name = f"model.language_model.layers.45.{mlp}.{projection}.weight"
+    entry = next(prepare_glm_mlp_weights([(name, tensor, kwargs)]))
+    assert entry[0] == name and entry[1] is tensor and entry[2] is kwargs
+
+
+def test_float_kpool_alias_is_streaming_and_preserves_tensor_and_kwargs():
+    tensor = torch.ones((4, 16), dtype=torch.bfloat16)
+    kwargs = {"sentinel": object()}
+
+    def weights():
+        yield "model.layers.45.self_attn.indexer.index_kpool_compress_gate.weight", tensor, kwargs
+        raise RuntimeError("Next shard has not been opened")
+
+    converted = prepare_glm_mlp_weights(weights())
+    name, actual, actual_kwargs = next(converted)
+    assert name == "model.layers.45.self_attn.indexer.index_kpool_compress_gate"
+    assert actual is tensor and actual_kwargs is kwargs
+    with pytest.raises(RuntimeError, match="Next shard"):
+        next(converted)
+
+
+def test_duplicate_bare_and_linear_kpool_aliases_are_rejected():
+    name = "layers.11.self_attn.indexer.index_kpool_compress_gate"
+    tensor = torch.ones((4, 16), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="Duplicate KPool"):
+        list(prepare_glm_mlp_weights([(name, tensor), (name + ".weight", tensor)]))
+
+
+def test_non_ct_loader_leaves_native_checkpoint_stream_untouched():
+    model = torch.nn.Module()
+    weights = iter([("layers.0.self_attn.kv_b_proj.weight", torch.ones(4, 4))])
+    assert _module.prepare_glm_packed_weights(model, weights) is weights
+
+
+@pytest.mark.parametrize("method", ["ascend", "fp8", "compressed-tensors"])
+def test_native_modelslim_and_float_ct_formats_do_not_enter_mlp_only_validation(method):
+    model = torch.nn.Module()
+    model.quant_config = SimpleNamespace(
+        get_name=lambda: method,
+        target_scheme_map={
+            "Linear": {"weights": SimpleNamespace(type="float"), "input_activations": SimpleNamespace(type="float")}
+        },
+    )
+    weights = iter([("layers.0.self_attn.kv_b_proj.weight_scale_inv", torch.ones(4))])
+    assert _module.prepare_glm_packed_weights(model, weights) is weights
+
+
+def test_model_owned_loader_keeps_packed_expert_codes_scales_and_kwargs():
+    model = torch.nn.Module()
+    model.experts = torch.nn.Module()
+    model.experts.scheme = SimpleNamespace(is_ct_packed=True, ct_packed_output=True)
+    model.config = SimpleNamespace(hidden_size=19, moe_intermediate_size=10)
+    codes = ((torch.arange(190).reshape(10, 19) % 16) - 8).to(torch.int8)
+    scale = torch.ones(10, 1, dtype=torch.bfloat16)
+    kwargs = {"sentinel": object()}
+    stem = "layers.11.mlp.experts.0.gate_proj"
+    result = list(
+        _module.prepare_glm_packed_weights(
+            model,
+            [
+                (stem + ".weight_shape", torch.tensor([10, 19])),
+                (stem + ".weight_packed", pack_to_int32(codes, 4), kwargs),
+                (stem + ".weight_scale", scale),
+            ],
+        )
+    )
+    assert result[0][0] == stem + ".weight" and result[0][2] is kwargs
+    assert result[0][1].shape == (5, 19)
+    from importlib import import_module
+
+    with patch.dict(sys.modules, {_package.__name__: _package}):
+        helper = import_module(f"{_package.__name__}.compressed_tensors_w4a8")
+    torch.testing.assert_close(helper.unpack_output_int4(result[0][1]), codes, rtol=0, atol=0)
+    assert result[1][0] == stem + ".weight_scale" and result[1][1] is scale
 
 
 @pytest.mark.parametrize("shape", [(1, 8), (7, 19), (19, 10)])

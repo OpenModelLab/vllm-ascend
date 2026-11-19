@@ -3,8 +3,12 @@
 ## 1. 适配范围
 
 模型源为 `zai-org/GLM-5.3-Flash-BF16`，使用现有 llm-compressor INT 混合产物：
-routed experts 为 INT4 权重、动态 token INT8 激活，shared 和其他线性投影为 W8A8。
+routed experts 为 INT4 权重、动态 token INT8 激活，dense/shared MLP 为 W8A8，非 MLP 保持浮点。
 主 DSA cache 与 KPool indexer cache 可分别选择 INT8。动态 C8 不需要重新导出 checkpoint。
+
+2026-11-19 起使用从 BF16 重新生成的 MLP-only 配方，旧宽范围产物不再由当前 CT INT 入口加载。
+本次精简、浮点 KPool 双名称兼容和最新验收说明见
+[MLP-only 教程](GLM5.3-Flash-CT-W4A8-A2-MLP-only.md)。下方迁移提交记录为历史来源，未改写。
 
 本仓库从官方 `releases/v0.32.0rc` 克隆，基线为
 `2dd5b2b2d2e22995821efeee8b0b265fcba5b612`；官方没有 `releases/v0.32.0` 分支。
@@ -24,9 +28,9 @@ routed experts 为 INT4 权重、动态 token INT8 激活，shared 和其他线�
 | A2 算子 | `is_950()` 为 false，走 A2/A3 原生 A8W4 GMM、INT64 编码 scale、校正 bias；显式 NZ 转换 |
 | GMM1 scale | 单个 3D 权重使用 `[E,1,N]`；专家列表保留全部 `[1,N]` scale，避免遗漏专家或误作量化组 |
 | SiLU | CT 实例使用分离 GMM1 → 原激活和 clamp → 动态 A8 → GMM2；ModelSlim 融合能力保留 |
-| W8A8 | 融合 QKV、KDA、shared、router、LM head、视觉、KPool、MTP 接入原生 scale 加载和计算 |
+| W8A8 | dense/shared MLP 接入原生融合、scale 加载和计算；非 MLP 走原生浮点实现 |
 | mHC | 保留裸浮点参数及原 FP32 执行；不创建不存在的 `.weight_scale` 槽位 |
-| KV-b | 沿用已批准的例外：用现有 INT8 码乘原 scale 分块恢复 BF16，供 MLA 吸收 |
+| KV-b | 新产物保留原始浮点权重，使用原生 MLA 吸收；已撤掉旧产物的 INT8 恢复分支 |
 | C8 | 复用 0.32 已有 SFA INT8 和 KPool INT8 路径，不从 A5 移植 HiF8/MXFP4 算子 |
 
 A2 不调用 A5 K-CG，不使用 format 53 或 ND→NZ 私有 storage 拷贝。
@@ -34,8 +38,8 @@ A2 不调用 A5 K-CG，不使用 format 53 或 ND→NZ 私有 storage 拷贝。
 0.32 KPool 查询使用完整 batch，未移入 main 的 query-row-shard 接口；
 SFA 保留 0.32 的 `replace_parameter(..., prefer_copy=True)` 兼容分支。
 
-不要求重新量化。名称中带 `A5-W4A8-CT` 的现有 **INT** 产物可以作为 A2 验证输入；
-名字中的 A5 不会把 INT4 码变成 MXFP4。A5 MXFP4/MXFP8、HiF8 目标不在本次范围。
+使用已重新量化的 MLP-only **INT** 产物。运行量化时的设备名称不决定权重格式；
+新 loader 会拒绝旧宽范围产物的非 MLP INT 权重/scale。A5 MXFP4/MXFP8、HiF8 目标不在本次范围。
 
 ## 3. 环境准备
 
@@ -102,10 +106,11 @@ ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest -q \
 
 ## 5. 真实模型启动
 
-使用已确认的 **910B3，64 GB × 4，TP=4 + EP**，沿用用户现有 INT checkpoint 路径。
+使用已确认的 **910B3，64 GB × 4，TP=4 + EP**，路径改为新 MLP-only checkpoint 的实际目录。
 NPU 0–3 是命令示例；若分配了其他卡，只替换可见设备列表，TP 仍为 4。
 EP 开启后 routed experts 按专家分配，其他可分片投影使用 TP；不是把每类权重一律除以 4。
 
+以下 155 GiB 为此前旧宽范围产物的历史估算，新 MLP-only 产物需按实际文件重新计算。
 按此前报告的约 155 GiB 产物粗估，平均静态权重约 **38.75 GiB/卡**。
 若运行时每卡显示 64 GiB，`--gpu-memory-utilization 0.85` 的目标预算约 54.4 GiB/卡，
 相减约 15.65 GiB；这部分还需容纳不均匀/复制权重、MLA 吸收、KV/SSM cache、工作区、
@@ -116,7 +121,7 @@ EP 开启后 routed experts 按专家分配，其他可分片投影使用 TP；�
 启动前检查当前产物的实际大小，下面是粗略均摊值，不是运行时峰值预测：
 
 ```bash
-MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-A5-W4A8-CT
+MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-MLP-W4A8-CT
 python - "$MODEL_PATH" <<'PY'
 import json, sys
 from pathlib import Path
@@ -133,7 +138,7 @@ PY
 
 ```bash
 cd /workspace
-MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-A5-W4A8-CT
+MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-MLP-W4A8-CT
 test -f "$MODEL_PATH/model.safetensors.index.json"
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve "$MODEL_PATH" \

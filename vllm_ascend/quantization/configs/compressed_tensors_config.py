@@ -31,7 +31,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -149,7 +148,7 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
     ) -> Optional["QuantizeMethodBase"]:
         from ..method_adapters import AscendFusedMoEMethod, AscendLinearMethod
 
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase):
             # Get the scheme for this layer
             linear_scheme = self._get_linear_scheme(layer=layer, layer_name=prefix)
 

@@ -3,6 +3,10 @@
 2026-11-18。环境为 910B3 64 GB × 4、TP4，镜像 `v0.32.0rc1-openeuler`，
 用户报告插件基线 `24487f4f4`，模型为已有 CT INT W4A8 产物。
 
+2026-11-19 后的精简版本使用重新生成的 MLP-only CT checkpoint；
+旧宽范围产物对应此前服务修订。见[当前适配范围](GLM5.3-Flash-CT-W4A8-A2-MLP-only.md)。
+以下原生 FLA 诊断和图模式配置仍适用，旧 eager 结果不作为新模型的图模式验收。
+
 ## 证据能说明什么
 
 报告中的 WARNING 来自 `patch/worker/patch_triton.py`：尝试从只有辅助函数的文件
@@ -148,7 +152,7 @@ CLI 生成参数的 8192 输出长度仍由客户端/AISBench 控制。
 
 ```bash
 cd /workspace
-MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-A5-W4A8-CT
+MODEL_PATH=/mnt/share/w30015592/models/GLM-5.3-Flash-MLP-W4A8-CT
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve "$MODEL_PATH" \
   --served-model-name glm53-ct-a2 --host 0.0.0.0 --port 8000 \

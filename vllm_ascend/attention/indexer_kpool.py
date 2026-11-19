@@ -32,7 +32,6 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, HardwareCapability, get_current_hardware_profile
-from vllm_ascend.quantization.glm5next import ct_kpool_input, ct_kpool_selectors
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
 
@@ -595,17 +594,6 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         return 2 if self.enable_sparse_li_c8 or self.kpool_int8 else 1
 
     def process_weights_after_loading(self) -> None:
-        self._ct_projections = isinstance(self.index_kpool_compress_gate, nn.Module)
-        if self._ct_projections:
-            self._key_weight, self._gate_weight = ct_kpool_selectors(
-                self.head_dim,
-                self.wk_weights_proj.input_size,
-                device=self.wk_weights_proj.weight.device,
-                dtype=torch.bfloat16,
-            )
-            self._norm_weight_f32 = self.k_norm.weight.detach().float() if self.k_norm.weight is not None else None
-            self._norm_bias_f32 = self.k_norm.bias.detach().float() if self.k_norm.bias is not None else None
-            return
         self._key_weight = self.wk_weights_proj.weight[: self.head_dim].detach().contiguous()
         self._gate_weight = self.index_kpool_compress_gate.detach().to(self._key_weight.dtype).contiguous()
         self._head_weight_f32 = self.wk_weights_proj.weight[self.head_dim :].detach().float().contiguous()
@@ -672,10 +660,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             if isinstance(q_c, tuple):
                 raise TypeError("GLM KPool backend requires an unquantized q_c tensor.")
             q_values = self.wq_b(q_c[:num_tokens])[0].view(num_tokens, self.n_head, self.head_dim)
-            if getattr(self, "_ct_projections", False):
-                weights = self.wk_weights_proj(hidden)[0][:, self.head_dim :].to(q_values.dtype)
-            else:
-                weights = F.linear(hidden.float(), self._head_weight_f32).to(q_values.dtype)
+            weights = F.linear(hidden.float(), self._head_weight_f32).to(q_values.dtype)
             weights = weights * (self.softmax_scale * self.n_head**-0.5)
 
         indexer_cache, *scale_caches = self._bound_caches(self.k_cache)
@@ -801,13 +786,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         # finish reading history. Whole-pool shifts preserve the pooling result.
         norm_eps = getattr(self.k_norm, "eps", getattr(self.k_norm, "variance_epsilon", 1e-6))
         state = self._prepare_keypool_state(tail_cache, cache_metadata.start_pos, tail_metadata, self.index_kpool)
-        pool_input = hidden_states
-        if getattr(self, "_ct_projections", False):
-            pool_input = ct_kpool_input(
-                hidden_states, self.wk_weights_proj, self.index_kpool_compress_gate, self.head_dim
-            )
         pooled_key = self._key_pool(
-            pool_input,
+            hidden_states,
             self._key_weight,
             self._gate_weight,
             self.index_kpool_compress_ape,
@@ -827,7 +807,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         tail_key = tail_gate = None
         if tail_metadata.cann_inputs.retained_indices is not None:
             # Re-project the live MTP rollback window missing from CANN state.
-            tail_hidden = self._gather_retained_hidden(pool_input, tail_metadata.cann_inputs.retained_indices)
+            tail_hidden = self._gather_retained_hidden(hidden_states, tail_metadata.cann_inputs.retained_indices)
             tail_key = F.linear(tail_hidden, self._key_weight).float()
             if self._norm_weight_f32 is not None:
                 tail_key = F.layer_norm(
