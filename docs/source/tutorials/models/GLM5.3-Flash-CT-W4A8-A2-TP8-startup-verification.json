@@ -1,0 +1,107 @@
+{
+  "date": "2026-11-19",
+  "parent_commit": "d90f0661cca767fe1c0fde8074b941dadb349300",
+  "scope": "GLM MLP-only CT; TP=8 without EP; optional host conversion and name lookup only",
+  "flag": {
+    "name": "VLLM_ASCEND_CT_FAST_LOAD",
+    "default": "0",
+    "enabled": "1",
+    "sensitive": false
+  },
+  "cpu_checks": {
+    "native_mlp_mode0": {
+      "exit_code": 0,
+      "seconds": 38.598,
+      "sha256": "a97d3d778a0849ebca969383489b8eb4d0ada81d470a4dd5b3871d218e915486"
+    },
+    "native_tp8_mode0": {
+      "exit_code": 0,
+      "seconds": 58.08,
+      "sha256": "0b6fc4daf48d8602d5af76b3fc6c7069a1a3829e46c65e1db260692aa1ecd169"
+    },
+    "native_mlp_mode1": {
+      "exit_code": 0,
+      "seconds": 25.691,
+      "sha256": "500fa1beecc03198f920aab97720c558cf1e0ca7e9f771bc5c6d23b270558d50"
+    },
+    "native_tp8_mode1": {
+      "exit_code": 0,
+      "seconds": 54.322,
+      "sha256": "e3c034532336a2e5005c451b29598f634929171f87e5d1d600aee8a310a3a903"
+    }
+  },
+  "final_checks": {
+    "packed_and_memory_cpu": {
+      "exit_code": 0,
+      "sha256": "06a5d1e7dbb7f7372d7ee4b4f7f32406013309a1c51123e1f842dcb49513db99"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "markdown": {
+      "exit_code": 0,
+      "sha256": "5a3631998dfebc526e5762665bd23736c214bf423df303fb31342fbba1d37200"
+    },
+    "python_compiled": 9,
+    "shell_blocks": 4
+  },
+  "cpu_test_items_passed": 151,
+  "cpu_test_count_note": "107 pytest cases plus (20 model-loader cases + 2 native-loader source cases) in each of modes 0 and 1; the latter includes all eight TP ranks.",
+  "benchmark": {
+    "device": "CPU",
+    "scope": "CPU repack only, not end-to-end startup or NPU performance",
+    "results": [
+      {
+        "n": 2048,
+        "k": 4096,
+        "num_threads": 1,
+        "legacy_median_ms": 127.76810000650585,
+        "direct_median_ms": 13.324999948963523,
+        "speedup": 9.588600412448347
+      },
+      {
+        "n": 4096,
+        "k": 2048,
+        "num_threads": 1,
+        "legacy_median_ms": 140.02609997987747,
+        "direct_median_ms": 14.30210005491972,
+        "speedup": 9.790597146026151
+      }
+    ],
+    "host_platform": "Windows-10-10.0.26200-SP0",
+    "python_version": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+    "torch_version": "2.14.1",
+    "compressed_tensors_version": "0.19.1a20261003"
+  },
+  "paired_vllm": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+  "code_paths_unchanged": [
+    "vllm_ascend/quantization/methods/w4a8/w4a8.py",
+    "vllm_ascend/quantization/compressed_tensors_w4a8.py",
+    "vllm_ascend/quantization/compressed_tensors_w4a8_a5.py",
+    "vllm_ascend/models/glm5next/ops/causal_conv1d.py"
+  ],
+  "npu_validation": {
+    "real_checkpoint_TP8": "pending_no_local_NPU",
+    "startup_time_cold_and_warm": "pending_no_local_NPU",
+    "kernel_numerics": "pending_no_local_NPU",
+    "C8": "pending_no_local_NPU",
+    "MTP": "pending_no_local_NPU",
+    "peak_memory": "pending_no_local_NPU",
+    "GPQA": "pending_no_local_NPU"
+  },
+  "full_format_sh_ci": "not_run_for_this_local_commit; pre-commit unavailable in preceding validation; no remote push performed",
+  "files_sha256": {
+    "docs/source/tutorials/models/index.md": "7196aae24d30eff7d5dc1a80f0dd413d3c69535537213383cdb18e3a8ba8e77f",
+    "tests/ut/quantization/test_compressed_tensors_packed.py": "e450056ef55dc8d6b629e0c1ed4e745f702c7f02598599095a91412e1fe6fc6a",
+    "tests/ut/quantization/test_ct_native_loader_source.py": "9bab7301d72b156cd0e95970a6a5dca62999e7b166fab347e1da2291446e30b5",
+    "tests/ut/quantization/test_glm5next_ct_linears.py": "0838f74c7dd955e57f17bff2252df37cf0c76907ecb976aa118c5241e2895879",
+    "vllm_ascend/envs.py": "e6d0e4bd92dd9dfc173e62f5bc7fb7d4338c543badcdc178b3b0028146801535",
+    "vllm_ascend/models/glm5next/model.py": "1294b01ef297a383c0db6076157ab5a907f08cf1eb2da6d61c4920f6fbbbc3cf",
+    "vllm_ascend/models/glm5next/mtp.py": "6bedc226da0b07caec316d82e03d306d4230dea05638d95966588c1c22f5fdc2",
+    "vllm_ascend/quantization/compressed_tensors_packed.py": "a8b05bfbcc01107d22cdcca00db6c863a45c7b7de64cf20abcbf3ac5be32daae",
+    "docs/source/tutorials/models/GLM5.3-Flash-CT-W4A8-A2-TP8-startup.md": "2ceaecb7f4aa412b74e3bdecc7aef5ce835a92c43c2b8fa9b0378c2a07b517ee",
+    "tests/ut/quantization/test_compressed_tensors_fast_load.py": "2b9c1d53924ba2d82861ea2b44b0227f8e098eaa3ccb295cfc1da69eca33143f",
+    "vllm_ascend/quantization/compressed_tensors_fast_load.py": "062c2bb130c44e03d6608151019d8a911fd11f87b3da23be7c592054cd8bc63d"
+  }
+}

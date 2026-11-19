@@ -61,6 +61,7 @@ def module(name, **attrs):
 
 
 def runtime(vllm_root):
+    module("vllm_ascend", __path__=[str(ROOT / "vllm_ascend")])
     state = SimpleNamespace(rank=0, world=1)
     logger = SimpleNamespace(info_once=lambda *a: None, warning_once=lambda *a: None, debug=lambda *a: None)
     scope = dict(
@@ -377,9 +378,16 @@ def runtime(vllm_root):
     execute_nodes(
         ROOT / "vllm_ascend/quantization/compressed_tensors_packed.py", scope, functions=("prepare_glm_packed_weights",)
     )
+    fast_spec = importlib.util.spec_from_file_location(
+        "glm_ct_fast_contract", ROOT / "vllm_ascend/quantization/compressed_tensors_fast_load.py"
+    )
+    fast_helper = importlib.util.module_from_spec(fast_spec)
+    fast_spec.loader.exec_module(fast_helper)
     module(
         "vllm_ascend.quantization.compressed_tensors_packed",
         prepare_glm_packed_weights=scope["prepare_glm_packed_weights"],
+        expert_mapping_candidates=fast_helper.expert_mapping_candidates,
+        index_expert_mapping=fast_helper.index_expert_mapping,
     )
     scope.update(
         get_spec_layer_idx_from_weight_name=lambda c, n: None,

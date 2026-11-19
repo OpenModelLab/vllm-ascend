@@ -333,7 +333,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.has_own_lm_head = own_head_weight in loaded_weights
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm_ascend.quantization.compressed_tensors_packed import prepare_glm_packed_weights
+        from vllm_ascend.quantization.compressed_tensors_packed import (
+            expert_mapping_candidates,
+            index_expert_mapping,
+            prepare_glm_packed_weights,
+        )
 
         weights = prepare_glm_packed_weights(self, weights)
         stacked_params_mapping = [
@@ -352,6 +356,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             num_experts=self.config.n_routed_experts,
         )
 
+        expert_mapping_index = index_expert_mapping(expert_params_mapping)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
@@ -413,7 +418,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 break
             else:
                 is_expert_weight = False
-                for mapping in expert_params_mapping:
+                for mapping in expert_mapping_candidates(expert_params_mapping, expert_mapping_index, name):
                     param_name, weight_name, expert_id, shard_id = mapping  # type: ignore[assignment]
                     if weight_name not in name:
                         continue

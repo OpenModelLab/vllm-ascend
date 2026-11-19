@@ -29,6 +29,11 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Temporary CT packed-MoE startup optimization. Valid values: 0 (default,
+    # existing loader), 1 (direct CPU repack and indexed expert-name lookup).
+    # Does not change quantized codes, scales, kernels or graph behavior.
+    # Not sensitive; disable to compare against the original loading path.
+    "VLLM_ASCEND_CT_FAST_LOAD": lambda: os.getenv("VLLM_ASCEND_CT_FAST_LOAD", "0") == "1",
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

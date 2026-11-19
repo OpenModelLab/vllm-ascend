@@ -17,7 +17,9 @@ from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
 _path = Path(__file__).resolve().parents[3] / "vllm_ascend/quantization/compressed_tensors_packed.py"
 _package = ModuleType("ct_packed_test_fixture")
 _package.__path__ = [str(_path.parent)]
-with patch.dict(sys.modules, {_package.__name__: _package}):
+_ascend_package = ModuleType("vllm_ascend")
+_ascend_package.__path__ = [str(_path.parent.parent)]
+with patch.dict(sys.modules, {_package.__name__: _package, "vllm_ascend": _ascend_package}):
     _spec = spec_from_file_location(f"{_package.__name__}.compressed_tensors_packed", _path)
     _module = module_from_spec(_spec)
     _spec.loader.exec_module(_module)

@@ -2,11 +2,23 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Load packed per-channel INT4 experts through the native INT8-code loader."""
 
+import logging
 from collections.abc import Iterable, Iterator, Mapping
 
 import torch
 from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
 
+from vllm_ascend import envs
+
+from .compressed_tensors_fast_load import (
+    expert_mapping_candidates as expert_mapping_candidates,
+)
+from .compressed_tensors_fast_load import (
+    index_expert_mapping as index_expert_mapping,
+)
+from .compressed_tensors_fast_load import (
+    repack_ct_int4,
+)
 from .compressed_tensors_w4a8 import pack_output_int4
 from .glm5next import is_glm_ct_int_config, prepare_glm_mlp_weights
 
@@ -27,6 +39,9 @@ def unpack_packed_moe_weights(
     Scales and other tensors pass through unchanged; integer codes are never
     dequantized or fitted again.
     """
+    fast_pack = packed_output and envs.VLLM_ASCEND_CT_FAST_LOAD
+    if fast_pack:
+        logging.getLogger("vllm").info("CT fast load enabled: direct CPU INT4 repack; native TP/EP slicing unchanged")
     for entry in weights:
         name, tensor = entry[:2]
         extra = entry[2:]
@@ -51,9 +66,12 @@ def unpack_packed_moe_weights(
                 f"Invalid {name}: expected INT32 packed shape {packed_shape} for {shape}, "
                 f"got {tensor.dtype} {tuple(tensor.shape)}"
             )
-        codes = unpack_from_int32(tensor, _INT4_BITS, torch.Size(shape)).contiguous()
-        if packed_output:
-            codes = pack_output_int4(codes)
+        if fast_pack:
+            codes = repack_ct_int4(tensor, shape)
+        else:
+            codes = unpack_from_int32(tensor, _INT4_BITS, torch.Size(shape)).contiguous()
+            if packed_output:
+                codes = pack_output_int4(codes)
         yield (f"{stem}.weight", codes, *extra)
 
 

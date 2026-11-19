@@ -746,7 +746,11 @@ class Glm5NextModel(nn.Module):
     # Entries are (name, weight) or (name, weight, kwargs); the optional third
     # element carries per-weight loader arguments used by the fused FP8 paths.
     def load_weights(self, weights: Iterable[tuple[Any, ...]]) -> set[str]:
-        from vllm_ascend.quantization.compressed_tensors_packed import prepare_glm_packed_weights
+        from vllm_ascend.quantization.compressed_tensors_packed import (
+            expert_mapping_candidates,
+            index_expert_mapping,
+            prepare_glm_packed_weights,
+        )
 
         weights = prepare_glm_packed_weights(self, weights)
         stacked_params_mapping = [
@@ -779,6 +783,7 @@ class Glm5NextModel(nn.Module):
             )
         else:
             expert_params_mapping = []
+        expert_mapping_index = index_expert_mapping(expert_params_mapping)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -840,7 +845,7 @@ class Glm5NextModel(nn.Module):
                     weight_name,
                     expert_id,
                     expert_shard_id,
-                ) in enumerate(expert_params_mapping):
+                ) in enumerate(expert_mapping_candidates(expert_params_mapping, expert_mapping_index, name)):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)

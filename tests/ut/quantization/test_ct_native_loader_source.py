@@ -65,6 +65,7 @@ class TestNativeCTLoaderSource(unittest.TestCase):
             OnlineMoEMethodBase=type("OnlineMoEMethodBase", (), {}),
         )
         fixture.module("vllm.model_executor.layers.fused_moe.routed_experts", RoutedExperts=scope["RoutedExperts"])
+        fixture.module("vllm_ascend", __path__=[str(ROOT / "vllm_ascend")])
         package = types.ModuleType("ct_native_pack_fixture")
         package.__path__ = [str(ROOT / "vllm_ascend/quantization")]
         sys.modules[package.__name__] = package
@@ -83,7 +84,7 @@ class TestNativeCTLoaderSource(unittest.TestCase):
                     self.cases.test_native_tp_ep_loading_preserves_codes_and_scales(size, rank, local_ids, padded)
 
     def test_compact_resident_codes_and_scales(self):
-        partitions = [(size, rank, (0, 1, 2, 3)) for size in (1, 2, 4) for rank in range(size)]
+        partitions = [(size, rank, (0, 1, 2, 3)) for size in (1, 2, 4, 8) for rank in range(size)]
         partitions += [(1, 0, (1, 3))]
         for size, rank, local_ids in partitions:
             with self.subTest(tp=size, rank=rank, local_ids=local_ids):
