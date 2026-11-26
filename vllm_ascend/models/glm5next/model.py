@@ -805,6 +805,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     # Entries are (name, weight) or (name, weight, kwargs); the optional third
     # element carries per-weight loader arguments used by the fused FP8 paths.
     def load_weights(self, weights: Iterable[tuple[Any, ...]]) -> set[str]:
+        if (quant_config := getattr(self, "quant_config", None)) is not None:
+            weights = quant_config.get_cache_scale_mapper().apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".conv1d", ".q_conv1d", 0),

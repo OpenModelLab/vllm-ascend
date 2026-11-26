@@ -17,12 +17,16 @@
 #
 """LLM-Compressor (compressed_tensors) quantization configuration for Ascend."""
 
+import json
+import re
 from typing import Any, Optional, cast
 
 import torch
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy, QuantizationType
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
@@ -34,12 +38,25 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
-from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD
+from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD, HIF8_C8_KV_CACHE_DTYPE, is_hif8_c8_kv_quant
 
 from ..methods import AscendLinearScheme, AscendMoEScheme
-from ..utils import is_fused_moe_layer
+from ..utils import get_model_file, is_fused_moe_layer
 
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, "QuantizationArgs"] | None]
+
+# GLM-5.3-Flash decoder/attention prefix (same shape as the ModelSlim HiF8
+# layer matching). The runtime ``prefix`` handed to ``get_quant_method`` for
+# the sparse-MLA (DSA) attention can be the ``self_attn`` wrapper, ``.attn``,
+# or the nested ``.mla_attn.mla_attn`` attention layer; the layer index is
+# captured so the checkpoint keys can be matched back to it.
+_GLM5NEXT_SELF_ATTN = re.compile(
+    r"^(?:model\.language_model|language_model\.model|model)\.layers\.(\d+)\.(?:mtp_block\.)?self_attn"
+)
+
+# Checkpoint tensor name of a HiF8 DSA scale exported by llm-compressor:
+# ``<hf-prefix>.layers.<idx>.(mtp_block.)?self_attn.(fa_q|fa_k).scale``.
+_HIF8_SCALE_KEY_RE = re.compile(r"layers\.(\d+)\.self_attn\.(fa_q|fa_k)\.scale$")
 
 
 @register_quantization_config(COMPRESSED_TENSORS_METHOD)
@@ -63,6 +80,12 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         # Map from [target -> scheme]
         self.target_scheme_map = target_scheme_map
         self.quant_description = config
+        # Lazily-resolved set of decoder layers that carry a HiF8 DSA recipe in
+        # the checkpoint (``fa_q.scale``/``fa_k.scale``). Compressed-tensors
+        # config.json has no per-layer HiF8 metadata, so the checkpoint's
+        # safetensors key list is the authoritative source (see
+        # ``_hif8_scale_layer_flags``).
+        self._hif8_scale_layers_cache: dict[str, dict[str, bool]] | None = None
 
     def get_name(self) -> str:
         return COMPRESSED_TENSORS_METHOD
@@ -175,7 +198,126 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
             logger.info_once("Using the vLLM Ascend llmcompressor Quantization now!")
             return AscendFusedMoEMethod(moe_scheme, layer.moe_config)
 
+        if isinstance(layer, AttentionLayerBase):
+            return self._get_attention_quant_method(layer, prefix)
+
         return None
+
+    def _get_attention_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+    ) -> Optional["QuantizeMethodBase"]:
+        """Resolve the quant method for an attention (KV-cache) layer.
+
+        This mirrors ModelSlim's HiF8 branch (``AscendModelSlimConfig``), but
+        determines HiF8 layer membership from the checkpoint's
+        ``fa_q.scale``/``fa_k.scale`` tensor presence instead of ModelSlim's
+        per-layer ``quant_type`` metadata, which compressed-tensors config.json
+        does not carry. The downstream scheme, scale loaders and the HiF8
+        quantize operator are identical for both producers.
+        """
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+
+        if (
+            is_hif8_c8_kv_quant(vllm_config)
+            and self._is_hif8_quant_layer(prefix)
+        ):
+            from ..method_adapters import AscendKVCacheMethod
+            from ..methods.kv_cache.hif8_c8 import (
+                AscendHIF8KVCacheAttentionMethod,
+                validate_sparse_sfa_hif8,
+            )
+
+            hif8_layers = [
+                layer_idx
+                for layer_idx, flags in self._hif8_scale_layer_flags().items()
+                if flags["fa_q"] and flags["fa_k"]
+            ]
+            validate_sparse_sfa_hif8(vllm_config, hif8_layers)
+            logger.debug("Select AscendKVCacheMethod(HIF8) for %s", prefix)
+            return AscendKVCacheMethod(AscendHIF8KVCacheAttentionMethod())
+
+        return None
+
+    def _is_hif8_quant_layer(self, prefix: str) -> bool:
+        """Whether ``prefix`` is a decoder layer whose checkpoint carries both
+        ``fa_q.scale`` and ``fa_k.scale`` (the llm-compressor HiF8 DSA recipe).
+
+        The runtime ``prefix`` must name the sparse-MLA attention itself, not a
+        sibling submodule (e.g. the indexer/tail cache layers also register as
+        ``AttentionLayerBase`` under ``self_attn.indexer`` / ``self_attn.tail``).
+        """
+        match = _GLM5NEXT_SELF_ATTN.match(prefix)
+        if match is None:
+            return False
+        if prefix[match.end() :] not in ("", ".attn", ".mla_attn.mla_attn"):
+            return False
+        flags = self._hif8_scale_layer_flags().get(match.group(1))
+        return flags is not None and flags["fa_q"] and flags["fa_k"]
+
+    def _hif8_scale_layer_flags(self) -> dict[str, dict[str, bool]]:
+        """Return ``{layer_index: {"fa_q": bool, "fa_k": bool}}`` for every
+        decoder layer that exports HiF8 DSA scale tensors, resolved lazily and
+        cached (the safetensors metadata is read at most once)."""
+        if self._hif8_scale_layers_cache is None:
+            self._hif8_scale_layers_cache = self._read_hif8_scale_layers()
+        return self._hif8_scale_layers_cache
+
+    def _read_hif8_scale_layers(self) -> dict[str, dict[str, bool]]:
+        """Inspect the checkpoint's safetensors metadata for HiF8 scale keys.
+
+        llm-compressor exports the static HiF8 DSA scales (``fa_q.scale`` /
+        ``fa_k.scale``) as plain buffers, so they are not described by the
+        compressed-tensors ``config_groups``. Their presence in the checkpoint
+        is therefore the only producer-independent signal that a layer uses the
+        HiF8 (sparse DSA) KV cache. Only the safetensors *index* / *header* is
+        read here -- no weight tensor is loaded -- and the result is cached.
+        """
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return {}
+        model_config = vllm_config.model_config
+        model = model_config.model
+        revision = getattr(model_config, "revision", None)
+
+        keys: list[str] = []
+        # Sharded checkpoints carry a small index mapping every weight name to
+        # its shard; prefer it (no tensor I/O).
+        index_path = get_model_file(model, "model.safetensors.index.json", revision=revision)
+        if index_path is not None:
+            with open(index_path, encoding="utf-8") as index_stream:
+                index = json.load(index_stream)
+            weight_map = index.get("weight_map") if isinstance(index, dict) else None
+            if isinstance(weight_map, dict):
+                keys = list(weight_map)
+
+        if not keys:
+            # Single-file checkpoint: read only the safetensors header keys.
+            from safetensors import SafetensorError, safe_open
+
+            for candidate in ("model.safetensors",):
+                path = get_model_file(model, candidate, revision=revision)
+                if path is None:
+                    continue
+                try:
+                    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+                        keys = list(checkpoint.keys())
+                except SafetensorError as exc:
+                    logger.warning("Could not read HiF8 scale metadata from %s: %s", path, exc)
+                    continue
+                break
+
+        flags: dict[str, dict[str, bool]] = {}
+        for key in keys:
+            match = _HIF8_SCALE_KEY_RE.search(key)
+            if match is None:
+                continue
+            layer_flags = flags.setdefault(match.group(1), {"fa_q": False, "fa_k": False})
+            layer_flags[match.group(2)] = True
+        return flags
 
     def _get_linear_scheme(self, layer: torch.nn.Module, layer_name: str | None = None) -> AscendLinearScheme | None:
         """Get the linear quantization scheme for a layer.
@@ -488,6 +630,22 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         is_static = not weight_quant.dynamic
 
         return input_quant_none and is_4_bits and is_group and is_static
+
+    def get_cache_scale_mapper(self) -> "WeightsMapper":
+        """Remap llm-compressor's HiF8 DSA scale keys to the nested MLA layer.
+
+        llm-compressor exports the static HiF8 DSA scales on the outer
+        ``self_attn`` (``self_attn.fa_q/fa_k.scale``), while AscendMLAAttention
+        registers them on the nested ``mla_attn.mla_attn`` layer. ModelSlim keeps
+        this remap in its own ``get_cache_scale_mapper``; compressed-tensors does
+        the same here so both backbone and MTP loaders share one source of truth.
+        """
+        orig_to_new_regex = {
+            re.compile(r"(?<!\.mla_attn\.mla_attn)\.fa_q\.scale$"): ".mla_attn.mla_attn.fa_q.scale",
+            re.compile(r"(?<!\.mla_attn\.mla_attn)\.fa_k\.scale$"): ".mla_attn.mla_attn.fa_k.scale",
+        }
+        mapper = WeightsMapper(orig_to_new_regex=orig_to_new_regex)
+        return mapper | QuantizationConfig.get_cache_scale_mapper()
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         self.target_scheme_map = hf_to_vllm_mapper.apply_dict(self.target_scheme_map)
