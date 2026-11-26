@@ -80,6 +80,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 
+from vllm_ascend.quantization.glm5next import glm5next_packed_mapping
 from vllm_ascend.utils import pad_sequence_parallel_tokens, vllm_version_is
 
 from .attention import Glm5NextMLAAttention
@@ -586,6 +587,7 @@ class Glm5NextModel(nn.Module):
         config = vllm_config.model_config.hf_text_config
         _validate_supported_config(config)
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
@@ -742,6 +744,13 @@ class Glm5NextModel(nn.Module):
     # Entries are (name, weight) or (name, weight, kwargs); the optional third
     # element carries per-weight loader arguments used by the fused FP8 paths.
     def load_weights(self, weights: Iterable[tuple[Any, ...]]) -> set[str]:
+        from vllm_ascend.quantization.compressed_tensors_packed import (
+            expert_mapping_candidates,
+            index_expert_mapping,
+            prepare_glm_packed_weights,
+        )
+
+        weights = prepare_glm_packed_weights(self, weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
@@ -772,6 +781,7 @@ class Glm5NextModel(nn.Module):
             )
         else:
             expert_params_mapping = []
+        expert_mapping_index = index_expert_mapping(expert_params_mapping)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -839,7 +849,7 @@ class Glm5NextModel(nn.Module):
                     weight_name,
                     expert_id,
                     expert_shard_id,
-                ) in enumerate(expert_params_mapping):
+                ) in enumerate(expert_mapping_candidates(expert_params_mapping, expert_mapping_index, name)):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
@@ -867,6 +877,10 @@ class Glm5NextModel(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
 
+                    if name.endswith((".hc_attn_fn", ".hc_ffn_fn")) and not loaded_weight.is_floating_point():
+                        raise ValueError(
+                            f"mHC requires a bare floating-point Parameter, got {name}: {loaded_weight.dtype}"
+                        )
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight, **kwargs)
@@ -876,6 +890,7 @@ class Glm5NextModel(nn.Module):
 
 class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, DeepseekV2MixtureOfExperts, IsHybrid):
     supports_replayssm: ClassVar[Literal[True]] = True
+    packed_modules_mapping = glm5next_packed_mapping()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -999,6 +1014,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, DeepseekV2Mixtur
 )
 class Glm5NextForConditionalGeneration(Glm4vForConditionalGeneration, HasInnerState, IsHybrid):
     supports_replayssm: ClassVar[Literal[True]] = True
+    packed_modules_mapping = glm5next_packed_mapping(Glm4vForConditionalGeneration.packed_modules_mapping)
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state

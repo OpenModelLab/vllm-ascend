@@ -29,6 +29,10 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Optional CPU shortcuts for CT expert loading: 0 (default) or 1.
+    # Direct INT4 repacking and indexed expert lookup preserve codes/scales.
+    # This is non-sensitive and independent of inference TP/EP world size.
+    "VLLM_ASCEND_CT_FAST_LOAD": lambda: bool(int(os.getenv("VLLM_ASCEND_CT_FAST_LOAD", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

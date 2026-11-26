@@ -2,11 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AscendC short convolution for GLM prefill, decode and MTP verification."""
 
+import inspect
+
 import torch
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state
+
+# Resolve the optional FLA API once, outside decode and ACL graph capture.
+try:
+    _UPDATE_HAS_MAX_QUERY_LEN = "max_query_len" in inspect.signature(causal_conv1d_update).parameters
+except (TypeError, ValueError):
+    _UPDATE_HAS_MAX_QUERY_LEN = False
 
 
 def causal_conv1d(
@@ -20,6 +28,7 @@ def causal_conv1d(
     initial_state_mode: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     output_buffer: torch.Tensor | None = None,
+    max_query_len: int | None = None,
 ) -> torch.Tensor:
     """Consume GDN metadata and update the caller's [cache, state_len, dim] state."""
     output = None
@@ -66,6 +75,11 @@ def causal_conv1d(
         # callers retain the original zero-initialized padding behavior.
         if output is None:
             output = torch.zeros_like(x)
+        if max_query_len is None:
+            max_query_len = x.shape[0]
+            if num_accepted_tokens is not None:
+                max_query_len = min(max_query_len, conv_state.shape[1] - weight.shape[0] + 2)
+        length_bound = {"max_query_len": max_query_len} if _UPDATE_HAS_MAX_QUERY_LEN else {}
         result = causal_conv1d_update(
             x,
             kernel_state,
@@ -77,6 +91,7 @@ def causal_conv1d(
             query_start_loc=query_start_loc,
             null_block_id=null_block_id,
             out=output,
+            **length_bound,
         )
     if needs_state_copy:
         copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=True)

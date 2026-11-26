@@ -245,7 +245,7 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
         slot_mapping=torch.tensor([8 * logical_size - 1, 2 * logical_size, 2 * logical_size + pool_size - 1, -1]),
         block_table_tensor=expanded,
     )
-    first, draft = [builder.build(0, common) for builder in builders]
+    first, draft = (builder.build(0, common) for builder in builders)
     # Kernel-granularity blocks: the metadata reports the natural kernel rows
     # (128 tokens / pool ratio) and passes the common expanded table through
     # as a view, so both builders observe the same persistent buffer.
@@ -316,7 +316,7 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
 
 
 def test_indexer_cache_rejects_unsupported_dtype():
-    with pytest.raises(ValueError, match="BF16 or FP8"):
+    with pytest.raises(ValueError, match="BF16, FP8 or INT8"):
         Glm5NextIndexerCache(
             head_dim=128,
             dtype=torch.float16,

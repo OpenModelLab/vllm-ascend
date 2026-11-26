@@ -68,6 +68,48 @@ class TestAscendCompressedTensorsQuanType(TestBase):
         result = self.config._detect_quant_type(weight, input_q, "int-quantized")
         self.assertEqual(result, "W4A8_DYNAMIC")
 
+    def test_packed_w4a8_preserves_activations_and_installs_compact_moe_scheme(self):
+        for global_format in ("pack-quantized", "mixed-precision"):
+            with self.subTest(global_format=global_format):
+                group = {
+                    "targets": ["Linear"],
+                    "weights": {"num_bits": 4, "type": "int", "strategy": "channel", "symmetric": True},
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "strategy": "token",
+                        "dynamic": True,
+                        "symmetric": True,
+                    },
+                }
+                if global_format == "mixed-precision":
+                    group["format"] = "pack-quantized"
+                # Group names are arbitrary identifiers, never format selectors.
+                config = AscendCompressedTensorsConfig.from_config(
+                    {"format": global_format, "config_groups": {"group_0": group}}
+                )
+                scheme = config.target_scheme_map["Linear"]
+                weight, activation = scheme["weights"], scheme["input_activations"]
+                self.assertIsNotNone(activation)
+                self.assertEqual(config._detect_quant_type(weight, activation, scheme["format"]), "W4A8_DYNAMIC")
+                with patch(
+                    "vllm_ascend.quantization.methods.get_scheme_class", return_value=lambda: MagicMock()
+                ) as get:
+                    method = config._create_scheme_for_layer_type(weight, activation, scheme["format"], "moe")
+                get.assert_called_once_with("W4A8_DYNAMIC", "moe")
+                self.assertIs(method.is_ct_packed, True)
+                self.assertIs(method.ct_packed_output, True)
+                with self.assertRaisesRegex(NotImplementedError, "only for routed MoE"):
+                    config._create_scheme_for_layer_type(weight, activation, scheme["format"], "linear")
+
+    def test_packed_w4a8_rejects_static_activations(self):
+        from compressed_tensors.quantization import QuantizationArgs
+
+        weight = QuantizationArgs(num_bits=4, type="int", strategy="channel", symmetric=True)
+        activation = QuantizationArgs(num_bits=8, type="int", strategy="tensor", dynamic=False, symmetric=True)
+        with self.assertRaises(NotImplementedError):
+            self.config._detect_quant_type(weight, activation, "pack-quantized")
+
     def test_detect_w4a16(self):
         from compressed_tensors.quantization import QuantizationType
 

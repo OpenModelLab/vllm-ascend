@@ -99,6 +99,8 @@ class HardwareCapability(Enum):
     FP8_ATTENTION = auto()
     # CANN PoolKeyIndexer quant_mode=0 with E4M3 query/key and FP32 descales.
     POOL_KEY_INDEXER_FP8 = auto()
+    # CANN PoolKeyIndexer quant_mode=2 with INT8 query/key and FP16 descales.
+    POOL_KEY_INDEXER_INT8 = auto()
     # Prepare and reuse the fixed CANN GBSA schedule across supported M3 decode layers.
     # Callers must also check block size, dtype, and uniform query length.
     MINIMAX_M3_GBSA_METADATA_REUSE = auto()
@@ -315,7 +317,11 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             moe_comm_policy=MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY,
             quantization_backend_family=QuantizationBackendFamily.STANDARD,
             capabilities=_STANDARD_CAPABILITIES
-            | {HardwareCapability.RMS_NORM_CAST, HardwareCapability.NPU_TOP_K_TOP_P},
+            | {
+                HardwareCapability.RMS_NORM_CAST,
+                HardwareCapability.NPU_TOP_K_TOP_P,
+                HardwareCapability.POOL_KEY_INDEXER_INT8,
+            },
         ),
         AscendDeviceType.A3: HardwareProfile(
             _device_type=AscendDeviceType.A3,
@@ -332,6 +338,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                 HardwareCapability.CANN_MEGAMOE,
                 HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
                 HardwareCapability.NPU_TOP_K_TOP_P,
+                HardwareCapability.POOL_KEY_INDEXER_INT8,
             },
         ),
         AscendDeviceType._310P: HardwareProfile(

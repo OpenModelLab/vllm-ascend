@@ -57,6 +57,7 @@ _EXPECTED_CAPABILITIES = {
     | {
         HardwareCapability.RMS_NORM_CAST,
         HardwareCapability.NPU_TOP_K_TOP_P,
+        HardwareCapability.POOL_KEY_INDEXER_INT8,
     },
     AscendDeviceType.A3: _STANDARD_CAPABILITIES
     | {
@@ -66,6 +67,7 @@ _EXPECTED_CAPABILITIES = {
         HardwareCapability.RMS_NORM_CAST,
         HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
         HardwareCapability.NPU_TOP_K_TOP_P,
+        HardwareCapability.POOL_KEY_INDEXER_INT8,
     },
     AscendDeviceType._310P: frozenset(
         {

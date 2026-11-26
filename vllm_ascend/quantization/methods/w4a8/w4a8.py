@@ -38,6 +38,7 @@ from vllm_ascend.utils import (
     maybe_trans_nz,
 )
 
+from ...compressed_tensors_w4a8 import log_loading_memory, process_expert_matrix
 from ..base import AscendLinearScheme, AscendMoEScheme, PreparedLinearInput, QuantType
 from ..registry import register_scheme
 
@@ -87,6 +88,12 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
       ``torch.int8``, ``[hidden_sizes, moe_intermediate_size]``.
     - Each linear also has ``weight_scale``: ``torch.bfloat16``,
       ``[out_features, 1]``.
+
+    CT ``pack-quantized`` checkpoints instead store ``weight_packed`` as
+    ``torch.int32`` of shape ``[out_features, ceil(in_features / 8)]`` plus
+    ``weight_shape``. The loader repacks these offset-binary codes into the
+    output-axis signed INT4 bytes before native TP/EP slicing; scales are
+    unchanged and weights are never requantized.
 
     During loading, ``gate_proj`` and ``up_proj`` are fused into ``w13``
     and ``down_proj`` is loaded as ``w2``. Before
@@ -143,6 +150,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         self.use_expert_weight_list = self.dynamic_eplb or (
             vllm_config.use_v2_model_runner is True and vllm_config.parallel_config.enable_eplb is True
         )
+        # The per-token SwiGLU fused operator rejects CT's correction assist.
+        # Use the native GMM1 -> activation/clamp -> dynamic A8 -> GMM2 path.
+        if self.quant_method == COMPRESSED_TENSORS_METHOD:
+            self.fused_activations = frozenset({"situ"})
         if self.quant_method == ASCEND_QUANTIZATION_METHOD and self.tp_size > _MODELSLIM_SCALE_BIAS_PARTITIONS:
             raise ValueError(f"The current weight does not support moe part tp>{_MODELSLIM_SCALE_BIAS_PARTITIONS}.")
 
@@ -158,9 +169,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
+        if getattr(self, "ct_packed_output", False) and (hidden_sizes % 2 or intermediate_size_per_partition % 2):
+            raise ValueError("CT output-axis INT4 packing requires even hidden/intermediate partitions")
         param_dict = {}
-        # Note: compressed‑tensors: one int4 per int8; modelslim: packs two int4 into one int8
-        if self.quant_method == COMPRESSED_TENSORS_METHOD:
+        # Expanded CT uses one code per byte; CT packed and Ascend storage use two.
+        if self.quant_method == COMPRESSED_TENSORS_METHOD and not getattr(self, "ct_packed_output", False):
             w13_output_size = 2 * intermediate_size_per_partition
             w2_output_size = hidden_sizes
         else:
@@ -283,9 +296,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
     def _pack_to_int32(self, weight: torch.Tensor):
         # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
         packed_bytes_per_int32 = _INT4_VALUES_PER_INT32 // _INT4_VALUES_PER_BYTE
-        assert weight.shape[-1] % packed_bytes_per_int32 == 0, (
-            f"the last dim of weight needs to be divided by {packed_bytes_per_int32} but got shape {weight.shape}"
-        )
+        assert (
+            weight.shape[-1] % packed_bytes_per_int32 == 0
+        ), f"the last dim of weight needs to be divided by {packed_bytes_per_int32} but got shape {weight.shape}"
         return weight.view(torch.int32).contiguous()
 
     def _process_scale(self, scale):
@@ -353,31 +366,24 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
     def process_weights_after_loading_compressed_tensors(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-
-        def update_bias_compressed_tensors(weight: torch.Tensor, scale: torch.Tensor):
-            group_num, k, n = weight.shape
-            scale = scale.transpose(1, 2).contiguous()
-            scale = scale.reshape(group_num, -1, n)
-            bias = 8 * (weight.to(torch.float32) * scale).sum(axis=1)
-            return bias
-
-        w13_bias = update_bias_compressed_tensors(layer.w13_weight.data, layer.w13_weight_scale.data)
-        w2_bias = update_bias_compressed_tensors(layer.w2_weight.data, layer.w2_weight_scale.data)
-        w13_scale_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
-        layer.register_parameter("w13_scale_bias", w13_scale_bias)
-        w2_scale_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
-        layer.register_parameter("w2_scale_bias", w2_scale_bias)
-
+        # Keep the source resident in INT4 and bound FP32 temporaries to one
+        # expert. Native NZ conversion and final INT32 packing follow unchanged.
+        log_loading_memory(layer, "before_repack")
+        for projection in ("w13", "w2"):
+            parameter = getattr(layer, f"{projection}_weight")
+            scale = getattr(layer, f"{projection}_weight_scale")
+            packed, bias = process_expert_matrix(
+                parameter.data,
+                scale.data,
+                packed_output=getattr(self, "ct_packed_output", False),
+            )
+            parameter.data = packed
+            layer.register_parameter(f"{projection}_scale_bias", torch.nn.Parameter(bias, requires_grad=False))
+            del packed, bias, parameter, scale
         layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data.to(torch.float32))
         layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data.to(torch.float32))
-        # To use torch_npu.npu_grouped_matmul, keep w2_weigh_scale unsqueezed
         layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
-
-        # Packs 2 int4 into 1 int8 on-the-fly to mirror the modelslim path
-        layer.w13_weight.data = self._pack_int4_to_int8(layer.w13_weight.data)
-        layer.w2_weight.data = self._pack_int4_to_int8(layer.w2_weight.data)
+        log_loading_memory(layer, "after_repack")
 
     def _get_mlp_weights(self, layer):
         """Return (w1, w1_scale, w2, w2_scale) in the standard MLP layout."""

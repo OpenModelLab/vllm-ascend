@@ -27,6 +27,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.triton.linearnorm.fused_eh_norm import fused_eh_norm
+from vllm_ascend.quantization.glm5next import glm5next_packed_mapping
 from vllm_ascend.utils import is_rot_weight_used, vllm_version_is
 
 from .model import (
@@ -140,6 +141,8 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
 
 class Glm5NextMultiTokenPredictor(nn.Module):
+    packed_modules_mapping = glm5next_packed_mapping()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -234,6 +237,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = glm5next_packed_mapping()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
@@ -328,6 +333,13 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.has_own_lm_head = own_head_weight in loaded_weights
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_ascend.quantization.compressed_tensors_packed import (
+            expert_mapping_candidates,
+            index_expert_mapping,
+            prepare_glm_packed_weights,
+        )
+
+        weights = prepare_glm_packed_weights(self, weights)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -345,6 +357,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         )
 
         params_dict = dict(self.named_parameters())
+        expert_mapping_index = index_expert_mapping(expert_params_mapping)
         loaded_params: set[str] = set()
         if vllm_version_is("0.32.0"):
             _pending_wk_fp8: dict = {}
@@ -411,7 +424,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 break
             else:
                 is_expert_weight = False
-                for mapping in expert_params_mapping:
+                for mapping in expert_mapping_candidates(expert_params_mapping, expert_mapping_index, name):
                     param_name, weight_name, expert_id, shard_id = mapping  # type: ignore[assignment]
                     if weight_name not in name:
                         continue

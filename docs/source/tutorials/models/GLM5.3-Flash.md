@@ -2,6 +2,9 @@
 
 # GLM-5.3-Flash
 
+For an MLP-only compressed-tensors W4A8 checkpoint on A2, see the
+[CT W4A8 main migration and acceptance guide](GLM5.3-Flash-CT-W4A8-A2-main.md).
+
 ## 1 Introduction
 
 !!! note
